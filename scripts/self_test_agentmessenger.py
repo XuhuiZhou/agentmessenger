@@ -140,6 +140,56 @@ def main() -> int:
         finally:
             stop_server(proc)
 
+        setup_db_path = Path(temp_dir) / "setup.sqlite3"
+        host_config = Path(temp_dir) / "host-config.json"
+        friend_config = Path(temp_dir) / "friend-config.json"
+        proc, url = start_server(setup_db_path, admin_token)
+        try:
+            hosted = json_cli(
+                url,
+                "host",
+                "--no-start",
+                "--agent",
+                "owner",
+                "--config",
+                str(host_config),
+                admin_token=admin_token,
+            )
+            assert hosted["agent"] == "owner"
+            assert hosted["join_code"].startswith("am_join_")
+            assert host_config.exists()
+
+            joined = json_cli(
+                url,
+                "join",
+                hosted["join_code"],
+                "--agent",
+                "friend",
+                "--config",
+                str(friend_config),
+            )
+            assert joined["agent"] == "friend"
+            assert friend_config.exists()
+            saved_friend = json.loads(friend_config.read_text())
+            assert saved_friend["agent"] == "friend"
+            assert saved_friend["api_key"].startswith("am_key_")
+
+            whoami = json_cli(url, "whoami", "--config", str(friend_config))["credential"]
+            assert whoami["kind"] == "identity"
+            assert whoami["agent"] == "friend"
+            json_cli(
+                url,
+                "announce",
+                "--config",
+                str(friend_config),
+                "--summary",
+                "Joined through one setup code.",
+            )
+            agents = json_cli(url, "agents", "--config", str(host_config))["agents"]
+            assert "friend" in {agent["name"] for agent in agents}
+        finally:
+            stop_server(proc)
+
         db_path = Path(temp_dir) / "broker.sqlite3"
         proc, url = start_server(db_path, admin_token)
         try:

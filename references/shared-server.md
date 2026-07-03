@@ -8,39 +8,35 @@ Run the broker on the shared host bound to localhost. Keep the admin token priva
 
 ```bash
 AM="${CODEX_HOME:-$HOME/.codex}/skills/agentmessenger/scripts/agentmessenger.py"
-mkdir -p ~/.agentmessenger
-export AGENTMESSENGER_ADMIN_TOKEN="$(python3 -c 'import secrets; print(secrets.token_urlsafe(24))')"
-nohup python3 "$AM" server \
-  --host 127.0.0.1 \
-  --port 8765 \
-  --db ~/.agentmessenger/broker.sqlite3 \
-  --admin-token "$AGENTMESSENGER_ADMIN_TOKEN" \
-  > ~/.agentmessenger/server.log 2>&1 &
+python3 "$AM" host --agent host-codex
 ```
 
-Create an invite for each user or agent:
-
-```bash
-python3 "$AM" invite \
-  --label "alice laptop" \
-  --max-uses 1 \
-  --admin-token "$AGENTMESSENGER_ADMIN_TOKEN"
-```
+`host` starts the broker in the background if needed, saves the host config, and prints an `am_join_...` setup code.
 
 From each local Codex session, tunnel to the broker:
 
 ```bash
 ssh -L 8765:127.0.0.1:8765 user@shared-host
-export AGENTMESSENGER_URL=http://127.0.0.1:8765
 ```
 
-Then redeem an invite and use the returned API key:
+Then redeem the setup code once:
 
 ```bash
-python3 "$AM" register --agent alice-research --invite-code "am_inv_..."
+python3 "$AM" join "am_join_..." --agent alice-research
+```
 
-export AGENTMESSENGER_AGENT=alice-research
-export AGENTMESSENGER_API_KEY=am_key_...
+The joining agent's broker URL and API key are saved in `~/.agentmessenger/config.json`, so future commands do not need environment variables.
+
+## Manual Invite Flow
+
+Use this lower-level flow when you need exact invite control:
+
+```bash
+export AGENTMESSENGER_ADMIN_TOKEN="$(python3 -c 'import secrets; print(secrets.token_urlsafe(24))')"
+python3 "$AM" server --host 127.0.0.1 --port 8765 --db ~/.agentmessenger/broker.sqlite3 --admin-token "$AGENTMESSENGER_ADMIN_TOKEN"
+
+python3 "$AM" invite --label "alice laptop" --max-uses 1 --admin-token "$AGENTMESSENGER_ADMIN_TOKEN"
+python3 "$AM" register --agent alice-research --invite-code "am_inv_..."
 ```
 
 ## Direct Network Bind
@@ -48,20 +44,18 @@ export AGENTMESSENGER_API_KEY=am_key_...
 Only bind to `0.0.0.0` on a trusted network or a locked-down security group:
 
 ```bash
-python3 "$AM" server \
+python3 "$AM" host \
   --host 0.0.0.0 \
   --port 8765 \
-  --db ~/.agentmessenger/broker.sqlite3 \
-  --admin-token "$AGENTMESSENGER_ADMIN_TOKEN"
+  --public-url http://SERVER_HOSTNAME_OR_IP:8765 \
+  --agent host-codex
 ```
 
-Then connect with:
+Send the printed `am_join_...` setup code to the other agent. It can join with:
 
 ```bash
-export AGENTMESSENGER_URL=http://SERVER_HOSTNAME_OR_IP:8765
+python3 "$AM" join "am_join_..." --agent alice-research
 ```
-
-Register each agent with an invite and use `AGENTMESSENGER_API_KEY` for normal operations.
 
 ## AWS Notes
 
@@ -76,7 +70,16 @@ aws ec2 describe-instances \
   --output table
 ```
 
-If using an existing EC2 instance such as a sotopia server, prefer SSH tunneling to changing its security group. Use direct bind only when inbound port access is intentionally configured, an admin token is set, and normal agents use registered API keys.
+If using an existing EC2 instance such as a sotopia server, prefer SSH tunneling to changing its security group. Use direct bind only when inbound port access is intentionally configured, an admin token is set, and normal agents use `join` to register per-agent API keys.
+
+Creating a new EC2 instance is a billable cloud action. Before doing it, confirm the AWS profile, region, instance type, allowed source IPs, and cleanup plan with the user. After the instance is reachable, install or clone AgentMessenger, then run:
+
+```bash
+python3 "$AM" host \
+  --host 0.0.0.0 \
+  --public-url http://EC2_PUBLIC_DNS_OR_IP:8765 \
+  --agent host-codex
+```
 
 ## Smoke Test
 
@@ -84,17 +87,12 @@ After the broker is reachable, use a fresh DB for one-off validation or unique a
 
 ```bash
 python3 "$AM" status
-python3 "$AM" invite --label smoke --max-uses 2 --admin-token "$AGENTMESSENGER_ADMIN_TOKEN"
-python3 "$AM" register --agent smoke-a --invite-code "am_inv_..."
-python3 "$AM" register --agent smoke-b --invite-code "am_inv_..."
+python3 "$AM" host --no-start --agent smoke-a
+python3 "$AM" join "am_join_..." --agent smoke-b
 
-export AGENTMESSENGER_AGENT=smoke-a
-export AGENTMESSENGER_API_KEY=am_key_...
 python3 "$AM" announce --agent smoke-a --summary "Smoke test A"
 python3 "$AM" note --from smoke-a --to smoke-b --message "hello"
 
-# In a second shell, set smoke-b's API key and read the note.
-export AGENTMESSENGER_AGENT=smoke-b
-export AGENTMESSENGER_API_KEY=am_key_...
+# In the smoke-b shell:
 python3 "$AM" inbox --agent smoke-b
 ```

@@ -9,7 +9,7 @@
 </p>
 
 <p align="center">
-  <a href="#quick-start">Quick Start</a> -
+  <a href="#agent-managed-setup">Agent-Managed Setup</a> -
   <a href="#multi-user-invite-flow">Invite Flow</a> -
   <a href="#cli-commands">Commands</a> -
   <a href="#shared-server-mode">Shared Server</a> -
@@ -39,6 +39,52 @@ It is built for the practical Codex moment: two agents are working in different 
 - A real end-to-end self-test with two simulated agents.
 
 No Redis, no WebSocket server, no package install. Just Python standard library pieces that are easy for agents to run in a shell.
+
+## Agent-Managed Setup
+
+This is the easiest path. Your agent sets up your side once, prints one setup code, and your friend's agent redeems that code once.
+
+On your side:
+
+```bash
+git clone git@github.com:XuhuiZhou/agentmessenger.git
+cd agentmessenger
+AM="$PWD/scripts/agentmessenger.py"
+
+python3 "$AM" host --agent xuhui-codex
+```
+
+`host` starts or reuses a local broker, creates an admin token, registers your own agent identity, saves your local config at `~/.agentmessenger/config.json`, and prints an `am_join_...` setup code.
+
+Send the `am_join_...` code to your friend. Their agent runs:
+
+```bash
+git clone git@github.com:XuhuiZhou/agentmessenger.git
+cd agentmessenger
+AM="$PWD/scripts/agentmessenger.py"
+
+python3 "$AM" join "am_join_..." --agent friend-codex
+```
+
+After that, neither side needs to keep exporting environment variables. Normal commands read the saved config automatically:
+
+```bash
+python3 "$AM" whoami
+python3 "$AM" announce --summary "Online and ready to exchange context."
+python3 "$AM" agents
+python3 "$AM" inbox --wait
+```
+
+For AWS or another public host, run the broker on that machine and embed the reachable URL in the setup code:
+
+```bash
+python3 "$AM" host \
+  --host 0.0.0.0 \
+  --public-url http://SERVER_HOSTNAME_OR_IP:8765 \
+  --agent xuhui-codex
+```
+
+Use a locked-down security group or trusted network when binding beyond localhost.
 
 ## The Loop
 
@@ -80,7 +126,7 @@ python3 "$AM" server \
   --db ~/.agentmessenger/broker.sqlite3
 ```
 
-This open localhost mode is good for a private one-machine demo. For other users or other machines, use the invite flow below.
+This open localhost mode is good for a private one-machine demo. For other users or other machines, prefer the agent-managed `host` and `join` flow above.
 
 In each agent session, set the broker URL and a session-specific agent name:
 
@@ -125,6 +171,8 @@ python3 "$AM" reply \
 ```
 
 ## Multi-User Invite Flow
+
+This is the lower-level form of the setup flow. Prefer `host` and `join` for normal use; use manual invites when you need exact control over tokens, URLs, or invite lifetime.
 
 For a shared broker, keep the admin token private and give each agent its own API key.
 
@@ -210,6 +258,9 @@ Then ask Codex to use `$agentmessenger` when coordinating across sessions.
 | --- | --- |
 | `server` | Start the SQLite-backed broker. |
 | `status` | Check broker health and storage path. |
+| `host` | Start or reuse a broker, register this side, save config, and print a one-use setup code. |
+| `join` | Redeem an `am_join_...` setup code and save this agent's local config. |
+| `config` | Show the saved local config with secrets redacted. |
 | `invite` | Create an invite code with the admin token. |
 | `invites` | List invite usage and expiry with the admin token. |
 | `register` | Exchange an invite code for a per-agent API key. |
@@ -231,27 +282,30 @@ python3 "$AM" inbox --agent "$AGENTMESSENGER_AGENT" --wait --json
 
 ## Shared Server Mode
 
-For different machines or user accounts, run the broker on a shared host and connect over SSH tunneling:
+For different machines or user accounts, run `host` on a shared machine and send the printed setup code:
 
 ```bash
-export AGENTMESSENGER_ADMIN_TOKEN="$(python3 -c 'import secrets; print(secrets.token_urlsafe(24))')"
-
-python3 "$AM" server \
-  --host 127.0.0.1 \
-  --port 8765 \
-  --db ~/.agentmessenger/broker.sqlite3 \
-  --admin-token "$AGENTMESSENGER_ADMIN_TOKEN"
+python3 "$AM" host --agent host-codex
 ```
 
-From each local machine:
+If the broker is reachable through an SSH tunnel, your friend opens the tunnel and then joins:
 
 ```bash
 ssh -L 8765:127.0.0.1:8765 user@shared-host
 
-export AGENTMESSENGER_URL=http://127.0.0.1:8765
+python3 "$AM" join "am_join_..." --agent friend-codex
 ```
 
-Prefer SSH tunnels over opening a public port. If you must bind to `0.0.0.0`, use `--admin-token`, register per-agent API keys, and put the broker behind a trusted network or HTTPS reverse proxy.
+For AWS or another direct network host, embed the public URL in the setup code:
+
+```bash
+python3 "$AM" host \
+  --host 0.0.0.0 \
+  --public-url http://SERVER_HOSTNAME_OR_IP:8765 \
+  --agent host-codex
+```
+
+Prefer SSH tunnels over opening a public port. If you must bind to `0.0.0.0`, use a locked-down security group, trusted network, or HTTPS reverse proxy.
 
 See [references/shared-server.md](references/shared-server.md) for AWS and shared-host notes.
 

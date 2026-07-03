@@ -11,31 +11,35 @@ Use this skill when agents need to exchange context without copying large chat l
 
 The bundled broker is a zero-dependency Python HTTP server backed by SQLite. In shell examples, first point `AM` at the installed skill script.
 
-For private localhost demos:
+Prefer the one-code setup flow when helping users connect multiple agents. The host side runs:
 
 ```bash
 AM="${CODEX_HOME:-$HOME/.codex}/skills/agentmessenger/scripts/agentmessenger.py"
+python3 "$AM" host --agent "$(whoami)-$(basename "$PWD")"
+```
+
+This starts or reuses a broker, registers the host agent, saves `~/.agentmessenger/config.json`, and prints an `am_join_...` setup code. Send only that setup code to the other user or agent.
+
+The joining side runs:
+
+```bash
+python3 "$AM" join "am_join_..." --agent "$(whoami)-$(basename "$PWD")"
+```
+
+After `host` or `join`, normal commands read the saved config automatically. Use `config` to inspect it with secrets redacted:
+
+```bash
+python3 "$AM" whoami
+python3 "$AM" config
+```
+
+For private localhost demos without saved config:
+
+```bash
 python3 "$AM" server --host 127.0.0.1 --port 8765 --db ~/.agentmessenger/broker.sqlite3
 ```
 
-For shared brokers, start with an admin token, create invite codes, and have each agent register its own API key:
-
-```bash
-export AGENTMESSENGER_ADMIN_TOKEN="$(python3 -c 'import secrets; print(secrets.token_urlsafe(24))')"
-python3 "$AM" server --host 127.0.0.1 --port 8765 --db ~/.agentmessenger/broker.sqlite3 --admin-token "$AGENTMESSENGER_ADMIN_TOKEN"
-
-python3 "$AM" invite --label "alice" --max-uses 1 --admin-token "$AGENTMESSENGER_ADMIN_TOKEN"
-python3 "$AM" register --agent alice --invite-code "am_inv_..."
-export AGENTMESSENGER_AGENT=alice
-export AGENTMESSENGER_API_KEY=am_key_...
-```
-
-Set these in every participating Codex session:
-
-```bash
-export AGENTMESSENGER_URL=http://127.0.0.1:8765
-export AGENTMESSENGER_AGENT="$(whoami)-$(basename "$PWD")"
-```
+For manual shared brokers, start with an admin token, create invite codes, and have each agent register its own API key. Prefer `host` and `join` unless the user explicitly wants the lower-level flow.
 
 Announce the local agent's current context:
 
@@ -78,9 +82,9 @@ python3 "$AM" reply \
 
 ## Workflow
 
-1. Start or locate a broker. Use `status` to verify it is reachable.
-2. For shared use, create an invite with `invite` and register the agent with `register`; set `AGENTMESSENGER_API_KEY`.
-3. Pick a stable `AGENTMESSENGER_AGENT` name that identifies the session, user, and workspace.
+1. If the user is hosting, run `host --agent <name>` and give the printed `am_join_...` setup code to the other user.
+2. If the user received a setup code, run `join "am_join_..." --agent <name>`.
+3. Use `status` or `whoami` to verify the saved config works.
 4. Run `announce` with a concise summary and optional context file.
 5. Use `agents` or `fetch --agent <name>` to discover available context.
 6. Use `ask --to <agent> --question ... --wait` for targeted context requests.
@@ -91,6 +95,7 @@ python3 "$AM" reply \
 - Do not send API keys, SSH keys, tokens, private credentials, or secrets.
 - Prefer summaries, file paths, command outputs, and bounded excerpts over whole transcripts.
 - If binding beyond localhost, require `--admin-token`, issue per-agent API keys through invites, use a trusted network or SSH tunnel, and avoid `0.0.0.0` unless the user explicitly needs remote access.
+- Treat `am_join_...` setup codes as bearer invites. They include a broker URL and a one-use invite code, but not an API key.
 - For shared smoke tests, use a fresh `--db` path and `--admin-token` so old messages or other clients cannot confuse the result.
 - Treat broker state as coordination state. SQLite persistence helps recover from restarts, but it is not a secure long-term archive.
 
@@ -100,6 +105,9 @@ Use `scripts/agentmessenger.py` for all operations. It supports:
 
 - `server`: start the SQLite-backed broker.
 - `status`: check broker health.
+- `host`: start or reuse a broker, register the host agent, save local config, and print a one-use `am_join_...` setup code.
+- `join`: redeem an `am_join_...` setup code or raw `am_inv_...` invite and save local config.
+- `config`: show saved local config with secrets redacted.
 - `invite`: create an invite code using the admin token.
 - `invites`: list invite usage and expiry using the admin token.
 - `register`: exchange an invite for a per-agent API key.

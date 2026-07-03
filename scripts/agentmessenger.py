@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import argparse
+import base64
 import hashlib
 import hmac
 import json
@@ -12,6 +13,7 @@ import re
 import signal
 import socket
 import sqlite3
+import subprocess
 import sys
 import threading
 import time
@@ -27,10 +29,13 @@ import secrets
 
 DEFAULT_URL = "http://127.0.0.1:8765"
 DEFAULT_DB = "~/.agentmessenger/broker.sqlite3"
+DEFAULT_CONFIG = "~/.agentmessenger/config.json"
+DEFAULT_LOG = "~/.agentmessenger/server.log"
 DEFAULT_TTL = 3600
 DEFAULT_INVITE_TTL = 7 * 24 * 3600
 MAX_WAIT_SECONDS = 120
-VERSION = "0.3.0"
+JOIN_CODE_PREFIX = "am_join_"
+VERSION = "0.4.0"
 
 
 class BrokerError(Exception):
@@ -72,6 +77,84 @@ def resolve_db_path(value: str | None) -> str:
     if value == ":memory:":
         return value
     return str(Path(value).expanduser())
+
+
+def resolve_config_path(value: str | None = None) -> Path:
+    return Path(value or os.environ.get("AGENTMESSENGER_CONFIG", DEFAULT_CONFIG)).expanduser()
+
+
+def load_config(path: str | Path | None = None) -> dict[str, Any]:
+    config_path = resolve_config_path(str(path) if path else None)
+    if not config_path.exists():
+        return {}
+    try:
+        loaded = json.loads(config_path.read_text(encoding="utf-8"))
+    except json.JSONDecodeError as exc:
+        raise SystemExit(f"Invalid AgentMessenger config at {config_path}: {exc}") from exc
+    if not isinstance(loaded, dict):
+        raise SystemExit(f"Invalid AgentMessenger config at {config_path}: expected object")
+    return loaded
+
+
+def save_config(config: dict[str, Any], path: str | Path | None = None) -> Path:
+    config_path = resolve_config_path(str(path) if path else None)
+    config_path.parent.mkdir(parents=True, exist_ok=True)
+    config_path.write_text(json.dumps(config, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+    try:
+        os.chmod(config_path, 0o600)
+    except OSError:
+        pass
+    return config_path
+
+
+def redact_config(config: dict[str, Any]) -> dict[str, Any]:
+    redacted = dict(config)
+    for key in ("api_key", "admin_token"):
+        if key in redacted and redacted[key]:
+            value = str(redacted[key])
+            redacted[key] = f"{value[:8]}...{value[-4:]}" if len(value) > 16 else "***"
+    return redacted
+
+
+def encode_join_code(payload: dict[str, Any]) -> str:
+    raw = json.dumps(payload, separators=(",", ":"), sort_keys=True).encode("utf-8")
+    encoded = base64.urlsafe_b64encode(raw).decode("ascii").rstrip("=")
+    return f"{JOIN_CODE_PREFIX}{encoded}"
+
+
+def decode_join_code(value: str) -> dict[str, Any]:
+    value = value.strip()
+    if not value:
+        raise SystemExit("join code is required")
+    if value.startswith("am_inv_"):
+        return {"kind": "agentmessenger-join", "version": 1, "invite_code": value}
+    if value.startswith(JOIN_CODE_PREFIX):
+        encoded = value.removeprefix(JOIN_CODE_PREFIX)
+        padding = "=" * (-len(encoded) % 4)
+        try:
+            decoded = base64.urlsafe_b64decode((encoded + padding).encode("ascii"))
+            payload = json.loads(decoded.decode("utf-8"))
+        except Exception as exc:
+            raise SystemExit("Invalid AgentMessenger join code") from exc
+        if not isinstance(payload, dict):
+            raise SystemExit("Invalid AgentMessenger join code")
+        if payload.get("kind") != "agentmessenger-join":
+            raise SystemExit("Join code is not for AgentMessenger")
+        return payload
+    raise SystemExit("Expected an am_join_ setup code or an am_inv_ invite code")
+
+
+def configured_agent(args: argparse.Namespace, attr: str = "agent") -> str:
+    value = getattr(args, attr, None)
+    if value:
+        return clean_agent_name(value)
+    env_value = os.environ.get("AGENTMESSENGER_AGENT")
+    if env_value:
+        return clean_agent_name(env_value)
+    config = load_config(getattr(args, "config", None))
+    if config.get("agent"):
+        return clean_agent_name(str(config["agent"]))
+    return default_agent_name()
 
 
 def read_context(text: str | None, file_path: str | None) -> str:
@@ -795,12 +878,24 @@ class Client:
             raise SystemExit(f"Could not reach AgentMessenger broker at {self.url}: {exc.reason}") from exc
 
 
-def make_client(args: argparse.Namespace, timeout: float = MAX_WAIT_SECONDS + 10) -> Client:
-    admin_token = getattr(args, "admin_token", None) or os.environ.get("AGENTMESSENGER_ADMIN_TOKEN")
+def make_client(
+    args: argparse.Namespace,
+    timeout: float = MAX_WAIT_SECONDS + 10,
+    use_admin: bool = False,
+) -> Client:
+    config = load_config(getattr(args, "config", None))
+    explicit_token = getattr(args, "token", None) or os.environ.get("AGENTMESSENGER_TOKEN")
+    explicit_admin = getattr(args, "admin_token", None) or os.environ.get("AGENTMESSENGER_ADMIN_TOKEN")
+    token = explicit_token or explicit_admin
+    if use_admin and not token:
+        token = str(config.get("admin_token") or "") or None
+    api_key = getattr(args, "api_key", None) or os.environ.get("AGENTMESSENGER_API_KEY")
+    if not api_key:
+        api_key = str(config.get("api_key") or "") or None
     return Client(
-        args.url or os.environ.get("AGENTMESSENGER_URL", DEFAULT_URL),
-        token=getattr(args, "token", None) or admin_token or os.environ.get("AGENTMESSENGER_TOKEN"),
-        api_key=getattr(args, "api_key", None) or os.environ.get("AGENTMESSENGER_API_KEY"),
+        getattr(args, "url", None) or os.environ.get("AGENTMESSENGER_URL") or str(config.get("url") or DEFAULT_URL),
+        token=token,
+        api_key=api_key,
         timeout=timeout,
     )
 
@@ -817,7 +912,7 @@ def cmd_invite(args: argparse.Namespace) -> int:
         "max_uses": args.max_uses,
         "ttl_seconds": args.ttl,
     }
-    result = make_client(args).request("POST", "/invites", payload)
+    result = make_client(args, use_admin=True).request("POST", "/invites", payload)
     if args.json:
         emit(args, result)
     else:
@@ -830,7 +925,7 @@ def cmd_invite(args: argparse.Namespace) -> int:
 
 
 def cmd_invites(args: argparse.Namespace) -> int:
-    result = make_client(args).request("GET", "/invites")
+    result = make_client(args, use_admin=True).request("GET", "/invites")
     if args.json:
         emit(args, result)
     else:
@@ -849,7 +944,7 @@ def cmd_invites(args: argparse.Namespace) -> int:
 
 
 def cmd_register(args: argparse.Namespace) -> int:
-    agent = clean_agent_name(args.agent or os.environ.get("AGENTMESSENGER_AGENT") or default_agent_name())
+    agent = configured_agent(args)
     payload = {
         "agent": agent,
         "invite_code": args.invite_code,
@@ -869,6 +964,227 @@ def cmd_register(args: argparse.Namespace) -> int:
     return 0
 
 
+def wait_for_broker(url: str, admin_token: str | None = None, timeout: float = 10) -> None:
+    deadline = time.time() + timeout
+    last_error: Exception | None = None
+    while time.time() < deadline:
+        try:
+            Client(url, token=admin_token, timeout=1).request("GET", "/health")
+            return
+        except SystemExit as exc:
+            last_error = exc
+            time.sleep(0.2)
+    if last_error is not None:
+        raise SystemExit(str(last_error))
+    raise SystemExit(f"Could not reach AgentMessenger broker at {url}")
+
+
+def broker_is_reachable(url: str, admin_token: str | None = None) -> bool:
+    try:
+        Client(url, token=admin_token, timeout=1).request("GET", "/health")
+        return True
+    except SystemExit:
+        return False
+
+
+def start_background_server(
+    host: str,
+    port: int,
+    db_path: str,
+    admin_token: str,
+    log_path: str,
+    quiet: bool = True,
+) -> int:
+    resolved_log = Path(log_path).expanduser()
+    resolved_log.parent.mkdir(parents=True, exist_ok=True)
+    command = [
+        sys.executable,
+        str(Path(__file__).resolve()),
+        "server",
+        "--host",
+        host,
+        "--port",
+        str(port),
+        "--db",
+        db_path,
+        "--admin-token",
+        admin_token,
+    ]
+    if quiet:
+        command.append("--quiet")
+    log_file = resolved_log.open("a", encoding="utf-8")
+    proc = subprocess.Popen(
+        command,
+        stdout=log_file,
+        stderr=subprocess.STDOUT,
+        start_new_session=True,
+    )
+    log_file.close()
+    return int(proc.pid)
+
+
+def register_with_invite(client: Client, agent: str, invite_code: str, display_name: str | None = None) -> dict[str, Any]:
+    payload = {
+        "agent": agent,
+        "invite_code": invite_code,
+        "display_name": display_name or agent,
+    }
+    return client.request("POST", "/register", payload)["identity"]
+
+
+def create_invite(client: Client, label: str, max_uses: int, ttl: int) -> dict[str, Any]:
+    payload = {"label": label, "max_uses": max_uses, "ttl_seconds": ttl}
+    return client.request("POST", "/invites", payload)["invite"]
+
+
+def cmd_host(args: argparse.Namespace) -> int:
+    config_path = resolve_config_path(args.config)
+    config = load_config(config_path)
+    local_url = args.url or os.environ.get("AGENTMESSENGER_URL") or str(config.get("url") or f"http://127.0.0.1:{args.port}")
+    public_url = args.public_url or local_url
+    admin_token = (
+        args.admin_token
+        or os.environ.get("AGENTMESSENGER_ADMIN_TOKEN")
+        or str(config.get("admin_token") or "")
+        or secrets.token_urlsafe(24)
+    )
+    db_path = resolve_db_path(args.db or str(config.get("db") or DEFAULT_DB))
+    log_path = str(Path(args.log or str(config.get("server_log") or DEFAULT_LOG)).expanduser())
+    server_pid: int | None = None
+
+    if args.no_start:
+        wait_for_broker(local_url, admin_token=admin_token, timeout=args.timeout)
+    elif broker_is_reachable(local_url, admin_token=admin_token):
+        server_pid = int(config["server_pid"]) if str(config.get("server_pid") or "").isdigit() else None
+    else:
+        server_pid = start_background_server(args.host, args.port, db_path, admin_token, log_path)
+        wait_for_broker(local_url, admin_token=admin_token, timeout=args.timeout)
+
+    admin_client = Client(local_url, token=admin_token)
+    agent = clean_agent_name(args.agent or str(config.get("agent") or "") or default_agent_name())
+    api_key = str(config.get("api_key") or "") if config.get("agent") == agent else ""
+    try:
+        if not api_key:
+            self_invite = create_invite(admin_client, f"host:{agent}", 1, args.ttl)
+            identity = register_with_invite(Client(local_url), agent, self_invite["code"], args.display_name or agent)
+            api_key = identity["api_key"]
+
+        invite_label = args.label or f"join:{agent}"
+        invite = create_invite(admin_client, invite_label, args.max_uses, args.ttl)
+    except SystemExit as exc:
+        raise SystemExit(
+            "Could not create an invite. If this broker was already running, rerun with "
+            "--admin-token or use the saved host config that contains the admin token. "
+            f"Original error: {exc}"
+        ) from exc
+    join_payload = {
+        "kind": "agentmessenger-join",
+        "version": 1,
+        "url": public_url,
+        "invite_code": invite["code"],
+        "label": invite_label,
+    }
+    if args.note:
+        join_payload["note"] = args.note
+    join_code = encode_join_code(join_payload)
+
+    saved = {
+        **config,
+        "url": local_url,
+        "agent": agent,
+        "api_key": api_key,
+        "admin_token": admin_token,
+        "db": db_path,
+        "server_log": log_path,
+        "updated_at": now(),
+    }
+    if server_pid:
+        saved["server_pid"] = server_pid
+    save_config(saved, config_path)
+
+    result = {
+        "agent": agent,
+        "config_path": str(config_path),
+        "url": local_url,
+        "public_url": public_url,
+        "join_code": join_code,
+        "invite": invite,
+        "server_pid": server_pid,
+        "server_log": log_path,
+    }
+    if args.json:
+        emit(args, result)
+    else:
+        print(f"AgentMessenger host is ready for {agent}.")
+        print(f"config: {config_path}")
+        print(f"broker url: {local_url}")
+        if server_pid:
+            print(f"server pid: {server_pid}")
+        print("\nSend this setup code to your friend:")
+        print(join_code)
+        print("\nYour friend can run:")
+        print(f"python3 {Path(__file__).resolve()} join {join_code}")
+    return 0
+
+
+def cmd_join(args: argparse.Namespace) -> int:
+    payload = decode_join_code(args.code)
+    config_path = resolve_config_path(args.config)
+    config = load_config(config_path)
+    previous_url = str(config.get("url") or "")
+    url = args.url or os.environ.get("AGENTMESSENGER_URL") or str(payload.get("url") or config.get("url") or "")
+    if not url:
+        raise SystemExit("Join code does not include a broker URL; pass --url http://host:port")
+    invite_code = str(payload.get("invite_code") or "")
+    if not invite_code:
+        raise SystemExit("Join code does not include an invite code")
+    agent = configured_agent(args)
+    identity = register_with_invite(Client(url), agent, invite_code, args.display_name or agent)
+    saved = {
+        **config,
+        "url": url,
+        "agent": identity["agent"],
+        "api_key": identity["api_key"],
+        "joined_at": now(),
+        "setup_label": payload.get("label", ""),
+    }
+    if previous_url and previous_url != url:
+        for key in ("admin_token", "db", "server_log", "server_pid"):
+            saved.pop(key, None)
+    save_config(saved, config_path)
+    result = {
+        "agent": identity["agent"],
+        "config_path": str(config_path),
+        "url": url,
+        "credential": "saved",
+    }
+    if args.json:
+        emit(args, result)
+    else:
+        print(f"Joined AgentMessenger as {identity['agent']}.")
+        print(f"config: {config_path}")
+        print("Saved broker URL and API key. Future commands can use the saved config automatically.")
+        print("\nTry:")
+        print(f"python3 {Path(__file__).resolve()} whoami")
+        print(f"python3 {Path(__file__).resolve()} agents")
+    return 0
+
+
+def cmd_config(args: argparse.Namespace) -> int:
+    config_path = resolve_config_path(args.config)
+    config = load_config(config_path)
+    payload = {"config_path": str(config_path), "config": redact_config(config)}
+    if args.json:
+        emit(args, payload)
+    else:
+        print(f"config: {config_path}")
+        if not config:
+            print("No saved AgentMessenger config yet.")
+            return 0
+        print(json.dumps(payload["config"], indent=2, sort_keys=True))
+    return 0
+
+
 def cmd_whoami(args: argparse.Namespace) -> int:
     result = make_client(args).request("GET", "/whoami")
     if args.json:
@@ -883,7 +1199,7 @@ def cmd_whoami(args: argparse.Namespace) -> int:
 
 
 def cmd_announce(args: argparse.Namespace) -> int:
-    agent = clean_agent_name(args.agent or os.environ.get("AGENTMESSENGER_AGENT") or default_agent_name())
+    agent = configured_agent(args)
     payload = {
         "summary": args.summary,
         "workspace": args.workspace or str(Path.cwd()),
@@ -936,7 +1252,7 @@ def cmd_fetch(args: argparse.Namespace) -> int:
 
 
 def cmd_ask(args: argparse.Namespace) -> int:
-    sender = clean_agent_name(args.from_agent or os.environ.get("AGENTMESSENGER_AGENT") or default_agent_name())
+    sender = configured_agent(args, "from_agent")
     recipient = clean_recipient(args.to)
     payload = {
         "sender": sender,
@@ -969,7 +1285,7 @@ def cmd_ask(args: argparse.Namespace) -> int:
 
 
 def cmd_inbox(args: argparse.Namespace) -> int:
-    agent = clean_agent_name(args.agent or os.environ.get("AGENTMESSENGER_AGENT") or default_agent_name())
+    agent = configured_agent(args)
     wait = args.timeout if args.wait else 0
     consume = "0" if args.no_consume or args.peek else "1"
     include = "1" if args.include_consumed else "0"
@@ -987,7 +1303,7 @@ def cmd_inbox(args: argparse.Namespace) -> int:
 
 
 def cmd_reply(args: argparse.Namespace) -> int:
-    sender = clean_agent_name(args.from_agent or os.environ.get("AGENTMESSENGER_AGENT") or default_agent_name())
+    sender = configured_agent(args, "from_agent")
     recipient = clean_recipient(args.to)
     payload = {
         "sender": sender,
@@ -1005,7 +1321,7 @@ def cmd_reply(args: argparse.Namespace) -> int:
 
 
 def cmd_note(args: argparse.Namespace) -> int:
-    sender = clean_agent_name(args.from_agent or os.environ.get("AGENTMESSENGER_AGENT") or default_agent_name())
+    sender = configured_agent(args, "from_agent")
     recipient = clean_recipient(args.to)
     payload = {
         "sender": sender,
@@ -1047,10 +1363,11 @@ def print_messages(messages: list[dict[str, Any]]) -> None:
 
 
 def add_client_options(parser: argparse.ArgumentParser) -> None:
-    parser.add_argument("--url", default=os.environ.get("AGENTMESSENGER_URL", DEFAULT_URL))
-    parser.add_argument("--token", default=os.environ.get("AGENTMESSENGER_TOKEN"), help="legacy/admin token")
-    parser.add_argument("--admin-token", default=os.environ.get("AGENTMESSENGER_ADMIN_TOKEN"))
-    parser.add_argument("--api-key", default=os.environ.get("AGENTMESSENGER_API_KEY"))
+    parser.add_argument("--url")
+    parser.add_argument("--token", help="legacy/admin token")
+    parser.add_argument("--admin-token")
+    parser.add_argument("--api-key")
+    parser.add_argument("--config", help=f"config path; default {DEFAULT_CONFIG}")
     parser.add_argument("--json", action="store_true", help="emit JSON")
 
 
@@ -1078,6 +1395,35 @@ def build_parser() -> argparse.ArgumentParser:
     add_client_options(status)
     status.set_defaults(func=cmd_status)
 
+    host = subparsers.add_parser("host", help="start or connect to a broker and print a one-use setup code")
+    add_client_options(host)
+    host.add_argument("--host", default="127.0.0.1", help="bind host when starting a broker")
+    host.add_argument("--port", type=int, default=8765)
+    host.add_argument("--public-url", help="URL embedded in the setup code; use for AWS or public hosts")
+    host.add_argument("--db", help=f"SQLite DB path; default {DEFAULT_DB}")
+    host.add_argument("--log", help=f"server log path; default {DEFAULT_LOG}")
+    host.add_argument("--agent")
+    host.add_argument("--display-name")
+    host.add_argument("--label", default="", help="label for the friend invite")
+    host.add_argument("--max-uses", type=int, default=1)
+    host.add_argument("--ttl", type=int, default=DEFAULT_INVITE_TTL)
+    host.add_argument("--timeout", type=int, default=10)
+    host.add_argument("--note", help="optional note embedded in the setup code")
+    host.add_argument("--no-start", action="store_true", help="use an already-running broker")
+    host.set_defaults(func=cmd_host)
+
+    join = subparsers.add_parser("join", help="redeem an am_join setup code and save local config")
+    add_client_options(join)
+    join.add_argument("code", help="am_join setup code or raw am_inv invite code")
+    join.add_argument("--agent")
+    join.add_argument("--display-name")
+    join.set_defaults(func=cmd_join)
+
+    config = subparsers.add_parser("config", help="show saved local config")
+    config.add_argument("--config", help=f"config path; default {DEFAULT_CONFIG}")
+    config.add_argument("--json", action="store_true", help="emit JSON")
+    config.set_defaults(func=cmd_config)
+
     invite = subparsers.add_parser("invite", help="create an invite code with the admin token")
     add_client_options(invite)
     invite.add_argument("--label", default="")
@@ -1091,7 +1437,7 @@ def build_parser() -> argparse.ArgumentParser:
 
     register = subparsers.add_parser("register", help="exchange an invite code for an agent API key")
     add_client_options(register)
-    register.add_argument("--agent", default=os.environ.get("AGENTMESSENGER_AGENT"))
+    register.add_argument("--agent")
     register.add_argument("--invite-code", required=True)
     register.add_argument("--display-name")
     register.set_defaults(func=cmd_register)
@@ -1102,7 +1448,7 @@ def build_parser() -> argparse.ArgumentParser:
 
     announce = subparsers.add_parser("announce", help="announce this agent's context")
     add_client_options(announce)
-    announce.add_argument("--agent", default=os.environ.get("AGENTMESSENGER_AGENT"))
+    announce.add_argument("--agent")
     announce.add_argument("--summary", required=True)
     announce.add_argument("--workspace", default=str(Path.cwd()))
     announce.add_argument("--ttl", type=int, default=DEFAULT_TTL)
@@ -1121,7 +1467,7 @@ def build_parser() -> argparse.ArgumentParser:
 
     ask = subparsers.add_parser("ask", help="ask another agent for context")
     add_client_options(ask)
-    ask.add_argument("--from", dest="from_agent", default=os.environ.get("AGENTMESSENGER_AGENT"))
+    ask.add_argument("--from", dest="from_agent")
     ask.add_argument("--to", required=True)
     ask.add_argument("--question", required=True)
     ask.add_argument("--wait", action="store_true")
@@ -1132,7 +1478,7 @@ def build_parser() -> argparse.ArgumentParser:
 
     inbox = subparsers.add_parser("inbox", help="read this agent's inbox")
     add_client_options(inbox)
-    inbox.add_argument("--agent", default=os.environ.get("AGENTMESSENGER_AGENT"))
+    inbox.add_argument("--agent")
     inbox.add_argument("--wait", action="store_true")
     inbox.add_argument("--timeout", type=int, default=60)
     inbox.add_argument("--since", default="0")
@@ -1143,7 +1489,7 @@ def build_parser() -> argparse.ArgumentParser:
 
     reply = subparsers.add_parser("reply", help="reply to a context request")
     add_client_options(reply)
-    reply.add_argument("--from", dest="from_agent", default=os.environ.get("AGENTMESSENGER_AGENT"))
+    reply.add_argument("--from", dest="from_agent")
     reply.add_argument("--to", required=True)
     reply.add_argument("--request-id", required=True)
     reply.add_argument("--message", required=True)
@@ -1153,7 +1499,7 @@ def build_parser() -> argparse.ArgumentParser:
 
     note = subparsers.add_parser("note", help="send a one-way note")
     add_client_options(note)
-    note.add_argument("--from", dest="from_agent", default=os.environ.get("AGENTMESSENGER_AGENT"))
+    note.add_argument("--from", dest="from_agent")
     note.add_argument("--to", required=True)
     note.add_argument("--message", required=True)
     note.add_argument("--ttl", type=int, default=DEFAULT_TTL)

@@ -22,6 +22,8 @@ Registered API keys are stored as SHA-256 hashes. Invite codes and API keys are 
 
 When an API key is used, the broker enforces that the credential can only announce, send, and read inbox messages as its registered `agent` identity. Admin credentials can act as any agent for maintenance and backward compatibility.
 
+The CLI `host` and `join` commands wrap this protocol for easy setup. A setup code starts with `am_join_` and contains a broker URL plus a one-use `am_inv_...` invite code. It does not contain an API key; the joining agent receives its API key only after calling `POST /register`.
+
 ## Endpoints
 
 All bodies and responses are JSON. Admin clients send `X-AgentMessenger-Token: <admin-token>` or `Authorization: Bearer <admin-token>`. Registered agents send `X-AgentMessenger-Api-Key: <api-key>`.
@@ -148,6 +150,13 @@ python3 scripts/agentmessenger.py server --host 0.0.0.0 --port 8765 --admin-toke
 ```
 
 Share only invite codes with users. Do not share the admin token with normal agents.
+
+For one-code setup, prefer:
+
+```bash
+python3 scripts/agentmessenger.py host --agent host-agent
+python3 scripts/agentmessenger.py join "am_join_..." --agent joining-agent
+```
 
 Run the bundled end-to-end test after protocol changes:
 
