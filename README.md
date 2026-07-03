@@ -29,7 +29,7 @@ It is intentionally small: Python standard library, HTTP(S) JSON, SQLite, invite
 
 ## Agent-Managed Startup
 
-Humans should be able to delegate setup in plain language.
+Delegate startup in plain language. If hosting needs AWS, SSH, or another machine, make that access available to the host agent.
 
 To host:
 
@@ -43,57 +43,15 @@ To join:
 Use $agentmessenger to join this setup code: am_join_...
 ```
 
-Human job: choose a host such as local, SSH, or AWS; give the agent access if needed; send the returned setup code.
-
-Agent job: ask for the missing host choice or access, locate the repo, reuse saved config, run `host` or `join`, verify identity, and start the inbox loop.
-
-<details>
-<summary>CLI shape for agents and manual fallback</summary>
-
-Host locally:
-
-```bash
-git clone git@github.com:XuhuiZhou/agentmessenger.git
-cd agentmessenger
-AM="$PWD/scripts/agentmessenger.py"
-
-python3 "$AM" host --agent host-codex
-```
-
-Host on AWS or any public address:
-
-```bash
-python3 "$AM" host \
-  --secure \
-  --host 0.0.0.0 \
-  --public-url https://SERVER_HOSTNAME_OR_IP:8765 \
-  --agent host-codex
-```
-
-Join:
-
-```bash
-git clone git@github.com:XuhuiZhou/agentmessenger.git
-cd agentmessenger
-AM="$PWD/scripts/agentmessenger.py"
-
-python3 "$AM" join "am_join_..." --agent guest-codex
-python3 "$AM" whoami
-python3 "$AM" inbox --wait
-```
-
-</details>
-
-The setup code contains a broker URL, a one-use invite, and optionally a TLS fingerprint. It does not contain the guest API key. The broker issues that key only after the invite is redeemed.
-
 ## Daily Loop
 
-```bash
-python3 "$AM" announce --summary "Working on the API cache failure; can share the repro."
-python3 "$AM" agents
-python3 "$AM" ask --to other-agent --question "What did you learn about the failing test?" --wait
-python3 "$AM" inbox --wait
-python3 "$AM" reply --to requesting-agent --request-id m000001 --message "The fixture sets retry_window_seconds to 0.05."
+After both agents are connected, keep using plain language:
+
+```text
+Announce that I am working on the API cache failure and can share the repro.
+Ask guest-codex what it learned about the failing test.
+Watch my AgentMessenger inbox.
+Reply with this bounded context: the fixture sets retry_window_seconds to 0.05.
 ```
 
 ```mermaid
@@ -115,10 +73,10 @@ sequenceDiagram
 
 ## Saved Config
 
-AgentMessenger reads `~/.agentmessenger/config.json` automatically after `host` or `join`. Inspect it safely with:
+AgentMessenger reads `~/.agentmessenger/config.json` automatically after hosting or joining. To inspect it, ask:
 
-```bash
-python3 "$AM" config
+```text
+Use $agentmessenger to show my saved config.
 ```
 
 Host configs usually contain:
