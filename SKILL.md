@@ -11,6 +11,8 @@ Treat people as contacts and sessions as agents. If the user says "ask Alice", p
 
 When the user asks this agent to host, first decide whether the hosting target is clear. If not, ask only the missing practical questions: where should the broker live (`local`, `SSH/shared host`, or `AWS/public VM`), what access or target should be used, and who the setup code is for. Do not ask the user to paste raw secrets; use available SSH/AWS/tool access or ask them to grant access in the environment. Reuse a healthy saved config before starting a new broker.
 
+When the user asks to invite someone, ask for the person's name if it is missing. Then find the host broker before creating anything: inspect saved config with `config`, verify reachability with `status`, and require a host config with `admin_token`. If this agent is not on the host machine/config, use available SSH/AWS access to run the invite from the host; otherwise ask the user to grant access to the host. Create exactly one contact setup code with `invite-contact <Name>`. Do not use raw `invite`/`register` for normal human invites.
+
 When the user provides an `am_join_...` setup code, treat it as an instruction to connect this agent. Do the setup yourself: run `join`, verify with `whoami`, announce the current context if useful, then offer to watch `inbox --wait`. If the setup code names a contact, this agent joins that contact's shared inbox. Do not ask the user to export environment variables unless the automatic config path fails.
 
 ## Quick Start
@@ -29,6 +31,12 @@ For hosting, the human can simply say:
 Use $agentmessenger to host a secure broker for me.
 ```
 
+For inviting a person after a broker exists, the human can say:
+
+```text
+Use $agentmessenger to invite Alice.
+```
+
 If the human has not named a hosting target, ask for one rather than guessing. Prefer SSH tunnels or existing shared hosts for private setups; use `host --secure` for public hosts or AWS.
 
 The host command is:
@@ -40,7 +48,13 @@ python3 "$AM" host --agent "$(whoami)-$(basename "$PWD")"
 
 This starts or reuses a broker, registers the host agent, saves `~/.agentmessenger/config.json`, and prints an `am_join_...` setup code. Send only that setup code to the other user or agent.
 
-When inviting a person, attach the setup code to a contact:
+When a host broker already exists, create a single contact invite:
+
+```bash
+python3 "$AM" invite-contact Alice
+```
+
+When starting a fresh broker and immediately inviting a person, attach the setup code to a contact:
 
 ```bash
 python3 "$AM" host --for Alice --agent "$(whoami)-$(basename "$PWD")"
@@ -124,13 +138,15 @@ python3 "$AM" reply \
 ## Workflow
 
 1. If the user is hosting, inspect saved config with `config` or `status`. If the target is unclear, ask where to host and what access is available.
-2. Run `host --for <Contact> --agent <name>` for local/private hosting, or `host --for <Contact> --secure --host 0.0.0.0 --public-url https://... --agent <name>` for public/AWS hosting. Give the printed `am_join_...` setup code to the other user.
-3. If the user received a setup code, run `join "am_join_..." --agent <name>`.
-4. Use `status` or `whoami` to verify the saved config works.
-5. Run `announce` with a concise summary and optional context file.
-6. Use `contacts`, `agents`, or `fetch --agent <name>` to discover available context.
-7. Use `ask --to <Contact> --question ... --wait` for human/contact-level requests. Use `--to-contact <Contact>` to force contact routing if a contact and agent share a name.
-8. In the receiving session, run `inbox --wait`, inspect the request, and respond with `reply`.
+2. Run `host --for <Contact> --agent <name>` for a fresh local/private broker, or `host --for <Contact> --secure --host 0.0.0.0 --public-url https://... --agent <name>` for a fresh public/AWS broker.
+3. If a broker already exists, run `invite-contact <Contact>` from the host config/machine. Pass `--public-url` if the saved host URL is local-only.
+4. Give the printed `am_join_...` setup code to the other user.
+5. If the user received a setup code, run `join "am_join_..." --agent <name>`.
+6. Use `status` or `whoami` to verify the saved config works.
+7. Run `announce` with a concise summary and optional context file.
+8. Use `contacts`, `agents`, or `fetch --agent <name>` to discover available context.
+9. Use `ask --to <Contact> --question ... --wait` for human/contact-level requests. Use `--to-contact <Contact>` to force contact routing if a contact and agent share a name.
+10. In the receiving session, run `inbox --wait`, inspect the request, and respond with `reply`.
 
 ## Safety Rules
 
@@ -151,7 +167,8 @@ Use `scripts/agentmessenger.py` for all operations. It supports:
 - `host`: start or reuse a broker, register the host agent, save local config, and print a one-use `am_join_...` setup code.
 - `join`: redeem an `am_join_...` setup code or raw `am_inv_...` invite and save local config.
 - `config`: show saved local config with secrets redacted.
-- `invite`: create an invite code using the admin token.
+- `invite-contact`: create one `am_join_...` setup code for a named human contact using the host config.
+- `invite`: create a low-level raw invite code using the admin token.
 - `invites`: list invite usage and expiry using the admin token.
 - `register`: exchange an invite for a per-agent API key.
 - `whoami`: show the current credential.

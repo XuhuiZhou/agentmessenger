@@ -24,7 +24,7 @@ Registered API keys are stored as SHA-256 hashes. Invite codes and API keys are 
 
 When an API key is used, the broker enforces that the credential can only announce, send, and read inbox messages as its registered `agent` identity. If that identity belongs to a `contact`, reading the agent inbox also includes messages addressed to that contact. Admin credentials can act as any agent for maintenance and backward compatibility.
 
-The CLI `host` and `join` commands wrap this protocol for easy setup. A setup code starts with `am_join_` and contains a broker URL plus a one-use `am_inv_...` invite code. It can also contain a `contact`, such as `Alice`. It does not contain an API key; the joining agent receives its API key only after calling `POST /register`.
+The CLI `host`, `invite-contact`, and `join` commands wrap this protocol for easy setup. A setup code starts with `am_join_` and contains a broker URL plus a one-use `am_inv_...` invite code. It can also contain a `contact`, such as `Alice`. It does not contain an API key; the joining agent receives its API key only after calling `POST /register`.
 
 For `host --secure`, the setup code also contains `tls_fingerprint`, the broker certificate's SHA-256 fingerprint. The joining client uses that fingerprint as a certificate pin. This allows secure public-IP setup without requiring DNS or a public CA certificate.
 
@@ -165,12 +165,13 @@ python3 scripts/agentmessenger.py host \
   --agent host-agent
 ```
 
-Share only invite codes with users. Do not share the admin token with normal agents. Use `--for Alice` when creating a setup code for a human contact.
+Share only setup codes with users. Do not share the admin token with normal agents. Use `invite-contact Alice` when an existing host broker should invite a human contact; use `host --for Alice` only when starting or reusing the broker as part of the same operation.
 
 For one-code setup, prefer:
 
 ```bash
 python3 scripts/agentmessenger.py host --for Alice --agent host-agent
+python3 scripts/agentmessenger.py invite-contact Alice
 python3 scripts/agentmessenger.py join "am_join_..." --agent joining-agent
 ```
 

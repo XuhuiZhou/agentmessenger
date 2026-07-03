@@ -193,6 +193,7 @@ def main() -> int:
         setup_db_path = Path(temp_dir) / "setup.sqlite3"
         host_config = Path(temp_dir) / "host-config.json"
         friend_config = Path(temp_dir) / "friend-config.json"
+        dana_config = Path(temp_dir) / "dana-config.json"
         proc, url = start_server(setup_db_path, admin_token)
         try:
             hosted = json_cli(
@@ -237,6 +238,30 @@ def main() -> int:
             )
             agents = json_cli(url, "agents", "--config", str(host_config))["agents"]
             assert "friend" in {agent["name"] for agent in agents}
+
+            dana_invite = json_cli(
+                url,
+                "invite-contact",
+                "Dana",
+                "--config",
+                str(host_config),
+            )
+            assert dana_invite["contact"] == "Dana"
+            assert dana_invite["join_code"].startswith("am_join_")
+            dana_joined = json_cli(
+                url,
+                "join",
+                dana_invite["join_code"],
+                "--agent",
+                "dana-codex",
+                "--config",
+                str(dana_config),
+            )
+            assert dana_joined["agent"] == "dana-codex"
+            assert dana_joined["contact"] == "Dana"
+            contacts = json_cli(url, "contacts", "--config", str(host_config))["contacts"]
+            dana = next(contact for contact in contacts if contact["contact"] == "Dana")
+            assert {agent["agent"] for agent in dana["agents"]} == {"dana-codex"}
         finally:
             stop_server(proc)
 

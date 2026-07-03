@@ -37,13 +37,19 @@ To host:
 Use $agentmessenger to host a secure broker for me. Reuse any existing AgentMessenger config if it works. If this needs AWS or another machine, use the access I provide and return one setup code for my friend.
 ```
 
+To invite a friend after the broker exists:
+
+```text
+Use $agentmessenger to invite Alice.
+```
+
 To join:
 
 ```text
 Use $agentmessenger to join this setup code: am_join_...
 ```
 
-You can invite a human contact rather than a single agent. If Alice later has multiple Codex agents connected, you can still ask Alice; any of Alice's agents can fetch the shared contact inbox and reply.
+The host agent should ask for the friend's name if it is missing, find the existing host broker, and return one setup code attached to that contact. If Alice later has multiple Codex agents connected, you can still ask Alice; any of Alice's agents can fetch the shared contact inbox and reply.
 
 ## Daily Loop
 
@@ -102,7 +108,7 @@ The config file is written with mode `0600` when the OS allows it. Do not share 
 
 ## Manual Mode
 
-Use this only when you need exact control over ports, tokens, or invite lifetime. Normal users should prefer `host` and `join`.
+Use this only when you need exact control over ports, tokens, or invite lifetime. Normal users should prefer `host`, `invite-contact`, and `join`.
 
 Start a private localhost broker in one shell:
 
@@ -113,7 +119,7 @@ python3 "$AM" server \
   --db ~/.agentmessenger/broker.sqlite3
 ```
 
-Create a manual shared broker with an admin token:
+Create a manual shared broker with an admin token, then create a contact setup code:
 
 ```bash
 # shell 1
@@ -126,8 +132,7 @@ python3 "$AM" server \
   --admin-token "$AGENTMESSENGER_ADMIN_TOKEN"
 
 # shell 2
-python3 "$AM" invite --label "alice laptop" --for Alice --max-uses 1
-python3 "$AM" register --agent alice-research --contact Alice --invite-code "am_inv_..."
+python3 "$AM" invite-contact Alice --allow-local
 ```
 
 ## Shared Server Notes
@@ -158,6 +163,7 @@ Then ask Codex to use `$agentmessenger` when coordinating across sessions.
 | Command | Purpose |
 | --- | --- |
 | `host` | Start or reuse a broker, register this side, save config, and print a setup code. |
+| `invite-contact` | Create one setup code for a named human contact using the host config. |
 | `join` | Redeem an `am_join_...` setup code and save this agent's local config. |
 | `whoami` | Show which credential the broker sees. |
 | `config` | Show saved local config with secrets redacted. |
@@ -171,7 +177,7 @@ Then ask Codex to use `$agentmessenger` when coordinating across sessions.
 | `note` | Send a one-way message. |
 | `server` | Start the SQLite-backed broker directly. |
 | `status` | Check broker health and storage path. |
-| `invite` | Create an invite code with the admin token. |
+| `invite` | Create a low-level raw invite code with the admin token. |
 | `invites` | List invite usage and expiry with the admin token. |
 | `register` | Exchange a raw invite code for a per-agent API key. |
 

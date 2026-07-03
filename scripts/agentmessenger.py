@@ -38,7 +38,7 @@ DEFAULT_TTL = 3600
 DEFAULT_INVITE_TTL = 7 * 24 * 3600
 MAX_WAIT_SECONDS = 120
 JOIN_CODE_PREFIX = "am_join_"
-VERSION = "0.6.0"
+VERSION = "0.6.1"
 
 
 class BrokerError(Exception):
@@ -127,6 +127,12 @@ def normalize_fingerprint(value: str | None) -> str | None:
     if len(cleaned) != 64:
         raise SystemExit("TLS fingerprint must be a SHA-256 hex digest")
     return cleaned.lower()
+
+
+def is_loopback_url(url: str) -> bool:
+    parsed = urllib.parse.urlparse(url)
+    host = parsed.hostname or ""
+    return host in {"127.0.0.1", "localhost", "::1"}
 
 
 def pem_cert_fingerprint(cert_path: str | Path) -> str:
@@ -1209,6 +1215,72 @@ def cmd_invites(args: argparse.Namespace) -> int:
     return 0
 
 
+def cmd_invite_contact(args: argparse.Namespace) -> int:
+    contact = clean_contact_name(args.contact)
+    if not contact:
+        raise SystemExit("contact name is required")
+    config_path = resolve_config_path(args.config)
+    config = load_config(config_path)
+    url = args.url or os.environ.get("AGENTMESSENGER_URL") or str(config.get("url") or "")
+    if not url:
+        raise SystemExit("No broker URL found. Run this on the host agent/machine or pass --url.")
+    admin_token = (
+        args.admin_token
+        or os.environ.get("AGENTMESSENGER_ADMIN_TOKEN")
+        or str(config.get("admin_token") or "")
+    )
+    if not admin_token:
+        raise SystemExit(
+            "No host admin token found. Run this from the host agent/machine, "
+            "use the host config, or grant this agent access to the host."
+        )
+    public_url = args.public_url or str(config.get("public_url") or "")
+    if not public_url:
+        public_url = url
+        if is_loopback_url(public_url) and not args.allow_local:
+            raise SystemExit(
+                "The saved broker URL is local-only. Pass --public-url with the address your friend can reach, "
+                "or rerun host with --public-url."
+            )
+    tls_fingerprint = normalize_fingerprint(
+        args.tls_fingerprint
+        or str(config.get("tls_fingerprint") or "")
+    )
+    client = Client(url, token=admin_token, tls_fingerprint=tls_fingerprint)
+    label = args.label or f"join:{contact}"
+    invite = create_invite(client, label, args.max_uses, args.ttl, contact)
+    join_code = make_join_code(
+        public_url,
+        invite["code"],
+        label,
+        contact=contact,
+        note=args.note,
+        tls_fingerprint=tls_fingerprint,
+    )
+    saved = {
+        **config,
+        "url": url,
+        "public_url": public_url,
+        "updated_at": now(),
+    }
+    save_config(saved, config_path)
+    result = {
+        "contact": contact,
+        "config_path": str(config_path),
+        "url": url,
+        "public_url": public_url,
+        "join_code": join_code,
+        "invite": invite,
+        "tls_fingerprint": tls_fingerprint,
+    }
+    if args.json:
+        emit(args, result)
+    else:
+        print(f"Setup code for {contact}:")
+        print(join_code)
+    return 0
+
+
 def cmd_register(args: argparse.Namespace) -> int:
     agent = configured_agent(args)
     payload = {
@@ -1324,6 +1396,30 @@ def create_invite(client: Client, label: str, max_uses: int, ttl: int, contact: 
     return client.request("POST", "/invites", payload)["invite"]
 
 
+def make_join_code(
+    public_url: str,
+    invite_code: str,
+    label: str,
+    contact: str = "",
+    note: str | None = None,
+    tls_fingerprint: str | None = None,
+) -> str:
+    payload = {
+        "kind": "agentmessenger-join",
+        "version": 1,
+        "url": public_url,
+        "invite_code": invite_code,
+        "label": label,
+    }
+    if contact:
+        payload["contact"] = contact
+    if note:
+        payload["note"] = note
+    if tls_fingerprint:
+        payload["tls_fingerprint"] = tls_fingerprint
+    return encode_join_code(payload)
+
+
 def cmd_host(args: argparse.Namespace) -> int:
     config_path = resolve_config_path(args.config)
     config = load_config(config_path)
@@ -1395,24 +1491,19 @@ def cmd_host(args: argparse.Namespace) -> int:
             "--admin-token or use the saved host config that contains the admin token. "
             f"Original error: {exc}"
         ) from exc
-    join_payload = {
-        "kind": "agentmessenger-join",
-        "version": 1,
-        "url": public_url,
-        "invite_code": invite["code"],
-        "label": invite_label,
-    }
-    if invite_contact:
-        join_payload["contact"] = invite_contact
-    if args.note:
-        join_payload["note"] = args.note
-    if tls_fingerprint:
-        join_payload["tls_fingerprint"] = tls_fingerprint
-    join_code = encode_join_code(join_payload)
+    join_code = make_join_code(
+        public_url,
+        invite["code"],
+        invite_label,
+        contact=invite_contact,
+        note=args.note,
+        tls_fingerprint=tls_fingerprint,
+    )
 
     saved = {
         **config,
         "url": local_url,
+        "public_url": public_url,
         "agent": agent,
         "api_key": api_key,
         "contact": host_contact,
@@ -1852,6 +1943,17 @@ def build_parser() -> argparse.ArgumentParser:
     invites = subparsers.add_parser("invites", help="list invites with the admin token")
     add_client_options(invites)
     invites.set_defaults(func=cmd_invites)
+
+    invite_contact = subparsers.add_parser("invite-contact", help="create one setup code for a named human contact")
+    add_client_options(invite_contact)
+    invite_contact.add_argument("contact", help="human/contact name, for example Alice")
+    invite_contact.add_argument("--public-url", help="URL embedded in the setup code; required if saved URL is local-only")
+    invite_contact.add_argument("--label", default="")
+    invite_contact.add_argument("--max-uses", type=int, default=1)
+    invite_contact.add_argument("--ttl", type=int, default=DEFAULT_INVITE_TTL)
+    invite_contact.add_argument("--note", help="optional note embedded in the setup code")
+    invite_contact.add_argument("--allow-local", action="store_true", help="allow a local-only setup URL")
+    invite_contact.set_defaults(func=cmd_invite_contact)
 
     register = subparsers.add_parser("register", help="exchange an invite code for an agent API key")
     add_client_options(register)
