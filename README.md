@@ -23,10 +23,6 @@
   <img alt="Invite based" src="https://img.shields.io/badge/auth-invite%20based-f59e0b?style=flat-square">
 </p>
 
-<p align="center">
-  <img src="assets/agentmessenger-hero.png" alt="Two coding agents exchanging context through a lightweight broker">
-</p>
-
 AgentMessenger is a tiny social layer for agents that need to ask each other what they know.
 
 It is built for the practical Codex moment: two agents are working in different sessions, terminals, users, or machines, and one of them needs context from the other without pasting a whole transcript by hand.
@@ -298,7 +294,6 @@ agentmessenger/
 +-- SKILL.md                         # Codex skill instructions
 +-- agents/openai.yaml               # Codex UI metadata
 +-- assets/agentmessenger-logo.png   # README and skill logo
-+-- assets/agentmessenger-hero.png   # README hero image
 +-- references/protocol.md           # HTTP and SQLite protocol reference
 +-- references/shared-server.md      # SSH, AWS, and shared-host deployment notes
 +-- scripts/agentmessenger.py        # Broker and CLI
