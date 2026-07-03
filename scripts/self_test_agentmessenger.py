@@ -202,11 +202,14 @@ def main() -> int:
                 "--no-start",
                 "--agent",
                 "owner",
+                "--contact",
+                "Owner",
                 "--config",
                 str(host_config),
                 admin_token=admin_token,
             )
             assert hosted["agent"] == "owner"
+            assert hosted["contact"] == "Owner"
             assert hosted["join_code"].startswith("am_join_")
             assert hosted["repo_url"] == "https://github.com/XuhuiZhou/agentmessenger"
             assert hosted["join_code"] in hosted["share_text"]
@@ -231,6 +234,15 @@ def main() -> int:
             whoami = json_cli(url, "whoami", "--config", str(friend_config))["credential"]
             assert whoami["kind"] == "identity"
             assert whoami["agent"] == "friend"
+            friend_contact = json_cli(
+                url,
+                "set-contact",
+                "Friend",
+                "--config",
+                str(friend_config),
+            )["identity"]
+            assert friend_contact["agent"] == "friend"
+            assert friend_contact["contact"] == "Friend"
             json_cli(
                 url,
                 "announce",
@@ -241,6 +253,12 @@ def main() -> int:
             )
             agents = json_cli(url, "agents", "--config", str(host_config))["agents"]
             assert "friend" in {agent["name"] for agent in agents}
+            assert next(agent for agent in agents if agent["name"] == "friend")["contact"] == "Friend"
+            owner_contact = next(
+                contact for contact in json_cli(url, "contacts", "--config", str(host_config))["contacts"]
+                if contact["contact"] == "Owner"
+            )
+            assert {agent["agent"] for agent in owner_contact["agents"]} == {"owner"}
 
             dana_invite = json_cli(
                 url,
@@ -292,12 +310,15 @@ def main() -> int:
                     str(Path(temp_dir) / "secure.key"),
                     "--agent",
                     "secure-owner",
+                    "--owner",
+                    "SecureOwner",
                     "--json",
                 ).stdout
             )
             secure_pid = int(secure_host["server_pid"])
             try:
                 assert secure_host["url"].startswith("https://")
+                assert secure_host["contact"] == "SecureOwner"
                 assert len(secure_host["tls_fingerprint"]) == 64
                 assert secure_host["join_code"] in secure_host["share_text"]
                 assert secure_host["repo_url"] == "https://github.com/XuhuiZhou/agentmessenger"

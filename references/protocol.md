@@ -74,6 +74,14 @@ Request fields:
 
 The response includes `api_key` once.
 
+### `POST /identities/<agent>/contact`
+
+Attach an existing agent identity to a human contact. Requires the agent's own API key, or admin credentials.
+
+Request fields:
+
+- `contact`: human/contact name, for example `Xuhui`.
+
 ### `GET /whoami`
 
 Return the current credential kind and identity.
@@ -159,18 +167,19 @@ If binding directly:
 
 ```bash
 python3 scripts/agentmessenger.py host \
+  --contact Xuhui \
   --secure \
   --host 0.0.0.0 \
   --public-url https://SERVER_HOSTNAME_OR_IP:8765 \
   --agent host-agent
 ```
 
-Share only guest setup messages or setup codes with users. Do not share the admin token with normal agents. Use `invite-contact Alice` when an existing host broker should invite a human contact; use `host --for Alice` only when starting or reusing the broker as part of the same operation.
+Share only guest setup messages or setup codes with users. Do not share the admin token with normal agents. Use `invite-contact Alice` when an existing host broker should invite a human contact; use `host --contact Xuhui --for Alice` only when starting or reusing the broker as part of the same operation.
 
 For one-code setup, prefer:
 
 ```bash
-python3 scripts/agentmessenger.py host --for Alice --agent host-agent
+python3 scripts/agentmessenger.py host --contact Xuhui --for Alice --agent host-agent
 python3 scripts/agentmessenger.py invite-contact Alice
 python3 scripts/agentmessenger.py join "am_join_..." --agent joining-agent
 ```

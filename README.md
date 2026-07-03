@@ -29,12 +29,12 @@ It is intentionally small: Python standard library, HTTP(S) JSON, SQLite, invite
 
 ## Agent-Managed Startup
 
-Delegate startup in plain language. If hosting needs AWS, SSH, or another machine, make that access available to the host agent.
+Delegate startup in plain language. If hosting needs AWS, SSH, or another machine, make that access available to the host agent. On first host setup, the agent should ask what name the server should know you as; that creates the host's first resident contact.
 
 To host:
 
 ```text
-Use $agentmessenger to host a secure broker for me. Reuse any existing AgentMessenger config if it works. If this needs AWS or another machine, use the access I provide and return one guest setup message for my friend.
+Use $agentmessenger to host a secure broker for me. Reuse any existing AgentMessenger config if it works. If you do not know my contact name, ask what name this server should know me as. If this needs AWS or another machine, use the access I provide and return one guest setup message for my friend.
 ```
 
 To invite a friend after the broker exists:
@@ -54,7 +54,7 @@ Then join this setup code for the Alice contact inbox:
 am_join_...
 ```
 
-The host agent should ask for the friend's name if it is missing, find the existing host broker, and return one guest setup message with the repo URL plus one setup code attached to that contact. If Alice later has multiple Codex agents connected, you can still ask Alice; any of Alice's agents can fetch the shared contact inbox and reply.
+The host agent should register the host under a human contact, ask for the friend's name if it is missing, find the existing host broker, and return one guest setup message with the repo URL plus one setup code attached to that contact. If Alice later has multiple Codex agents connected, you can still ask Alice; any of Alice's agents can fetch the shared contact inbox and reply.
 
 ## Daily Loop
 
@@ -97,6 +97,7 @@ Host configs usually contain:
 
 - `admin_token`: secret owner token for creating/listing invites.
 - `agent` and `api_key`: the host agent's normal messaging identity.
+- `contact`: the host human contact, for example `Xuhui`.
 - `url`: the local broker URL.
 - `db`, `server_pid`, `server_log`: server state and process metadata.
 - `tls_cert`, `tls_key`, `tls_fingerprint`: HTTPS material when `--secure` is used.
@@ -172,6 +173,7 @@ Then ask Codex to use `$agentmessenger` when coordinating across sessions.
 | `host` | Start or reuse a broker, register this side, save config, and print a guest setup message. |
 | `invite-contact` | Create one guest setup message for a named human contact using the host config. |
 | `join` | Redeem an `am_join_...` setup code and save this agent's local config. |
+| `set-contact` | Attach this agent identity to a human contact. |
 | `whoami` | Show which credential the broker sees. |
 | `config` | Show saved local config with secrets redacted. |
 | `announce` | Publish this agent's summary, workspace, metadata, and optional context. |

@@ -9,7 +9,7 @@ Use this skill when agents need to exchange context without copying large chat l
 
 Treat people as contacts and sessions as agents. If the user says "ask Alice", prefer sending to Alice's contact inbox rather than guessing one of Alice's concrete agent names. Use specific agent names only when the user names one or when contact routing is unavailable.
 
-When the user asks this agent to host, first decide whether the hosting target is clear. If not, ask only the missing practical questions: where should the broker live (`local`, `SSH/shared host`, or `AWS/public VM`), what access or target should be used, and who the setup code is for. Do not ask the user to paste raw secrets; use available SSH/AWS/tool access or ask them to grant access in the environment. Reuse a healthy saved config before starting a new broker.
+When the user asks this agent to host, first decide whether the hosting target and host contact are clear. If not, ask only the missing practical questions: where should the broker live (`local`, `SSH/shared host`, or `AWS/public VM`), what name the server should know the host human as, what access or target should be used, and who the setup code is for. The host human is the first resident of the server; pass that name with `host --contact <HostContact>` so every host-side agent can receive messages sent to the host contact. Do not ask the user to paste raw secrets; use available SSH/AWS/tool access or ask them to grant access in the environment. Reuse a healthy saved config before starting a new broker.
 
 When the user asks to invite someone, ask for the person's name if it is missing. Then find the host broker before creating anything: inspect saved config with `config`, verify reachability with `status`, and require a host config with `admin_token`. If this agent is not on the host machine/config, use available SSH/AWS access to run the invite from the host; otherwise ask the user to grant access to the host. Create exactly one contact setup code with `invite-contact <Name>`. Return the full guest setup message from the CLI output or JSON `share_text`, not only the bare `am_join_...` code. Do not use raw `invite`/`register` for normal human invites.
 
@@ -48,10 +48,10 @@ The host command is:
 
 ```bash
 AM="${CODEX_HOME:-$HOME/.codex}/skills/agentmessenger/scripts/agentmessenger.py"
-python3 "$AM" host --agent "$(whoami)-$(basename "$PWD")"
+python3 "$AM" host --contact Xuhui --agent "$(whoami)-$(basename "$PWD")"
 ```
 
-This starts or reuses a broker, registers the host agent, saves `~/.agentmessenger/config.json`, and prints a guest setup message containing the repo URL and one `am_join_...` setup code. Send the whole guest setup message to the other user or agent.
+This starts or reuses a broker, registers the host agent under the host contact, saves `~/.agentmessenger/config.json`, and prints a guest setup message containing the repo URL and one `am_join_...` setup code. Send the whole guest setup message to the other user or agent.
 
 When a host broker already exists, create a single contact invite:
 
@@ -62,7 +62,7 @@ python3 "$AM" invite-contact Alice
 When starting a fresh broker and immediately inviting a person, attach the setup code to a contact:
 
 ```bash
-python3 "$AM" host --for Alice --agent "$(whoami)-$(basename "$PWD")"
+python3 "$AM" host --contact Xuhui --for Alice --agent "$(whoami)-$(basename "$PWD")"
 ```
 
 Alice can join multiple agents under the same contact. Later, send messages to `Alice`; every Alice agent can fetch the shared contact inbox, and the reply still records the concrete responding agent.
@@ -142,8 +142,8 @@ python3 "$AM" reply \
 
 ## Workflow
 
-1. If the user is hosting, inspect saved config with `config` or `status`. If the target is unclear, ask where to host and what access is available.
-2. Run `host --for <Contact> --agent <name>` for a fresh local/private broker, or `host --for <Contact> --secure --host 0.0.0.0 --public-url https://... --agent <name>` for a fresh public/AWS broker.
+1. If the user is hosting, inspect saved config with `config` or `status`. If the target or host contact is unclear, ask where to host, what name the server should know the host as, and what access is available.
+2. Run `host --contact <HostContact> --for <GuestContact> --agent <name>` for a fresh local/private broker, or `host --contact <HostContact> --for <GuestContact> --secure --host 0.0.0.0 --public-url https://... --agent <name>` for a fresh public/AWS broker.
 3. If a broker already exists, run `invite-contact <Contact>` from the host config/machine. Pass `--public-url` if the saved host URL is local-only.
 4. Give the printed guest setup message to the other user.
 5. If the user received a guest setup message or setup code, install AgentMessenger from the repo URL if needed, then run `join "am_join_..." --agent <name>`.
@@ -172,6 +172,7 @@ Use `scripts/agentmessenger.py` for all operations. It supports:
 - `host`: start or reuse a broker, register the host agent, save local config, and print a guest setup message with a one-use `am_join_...` setup code.
 - `join`: redeem an `am_join_...` setup code or raw `am_inv_...` invite and save local config.
 - `config`: show saved local config with secrets redacted.
+- `set-contact`: attach this agent identity to a human contact.
 - `invite-contact`: create one guest setup message for a named human contact using the host config.
 - `invite`: create a low-level raw invite code using the admin token.
 - `invites`: list invite usage and expiry using the admin token.

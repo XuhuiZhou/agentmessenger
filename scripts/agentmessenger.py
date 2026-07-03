@@ -38,7 +38,7 @@ DEFAULT_TTL = 3600
 DEFAULT_INVITE_TTL = 7 * 24 * 3600
 MAX_WAIT_SECONDS = 120
 JOIN_CODE_PREFIX = "am_join_"
-VERSION = "0.6.2"
+VERSION = "0.6.3"
 REPO_URL = "https://github.com/XuhuiZhou/agentmessenger"
 
 
@@ -236,6 +236,14 @@ def configured_agent(args: argparse.Namespace, attr: str = "agent") -> str:
     if config.get("agent"):
         return clean_agent_name(str(config["agent"]))
     return default_agent_name()
+
+
+def configured_contact(args: argparse.Namespace, config: dict[str, Any]) -> str:
+    return clean_contact_name(
+        getattr(args, "contact", None)
+        or os.environ.get("AGENTMESSENGER_CONTACT")
+        or str(config.get("contact") or "")
+    )
 
 
 def read_context(text: str | None, file_path: str | None) -> str:
@@ -521,6 +529,21 @@ class BrokerState:
             rows = self.conn.execute("SELECT * FROM identities ORDER BY agent").fetchall()
             return [identity_from_row(row) for row in rows]
 
+    def set_identity_contact(self, agent_name: str, contact: str) -> dict[str, Any]:
+        agent_name = clean_agent_name(agent_name)
+        contact_name = clean_contact_name(contact)
+        if not contact_name:
+            raise BrokerError("contact is required")
+        with self.lock:
+            cursor = self.conn.execute(
+                "UPDATE identities SET contact = ?, last_seen_at = ? WHERE agent = ?",
+                (contact_name, now(), agent_name),
+            )
+            if cursor.rowcount == 0:
+                raise BrokerError("agent identity not found", HTTPStatus.NOT_FOUND)
+            row = self.conn.execute("SELECT * FROM identities WHERE agent = ?", (agent_name,)).fetchone()
+            return identity_from_row(row)
+
     def has_agent_identity(self, agent_name: str) -> bool:
         row = self.conn.execute("SELECT 1 FROM identities WHERE agent = ?", (agent_name,)).fetchone()
         return row is not None
@@ -637,7 +660,15 @@ class BrokerState:
     def fetch_agent(self, agent_name: str) -> dict[str, Any] | None:
         with self.lock:
             self.cleanup()
-            row = self.conn.execute("SELECT * FROM agents WHERE name = ?", (agent_name,)).fetchone()
+            row = self.conn.execute(
+                """
+                SELECT agents.*, identities.contact AS contact
+                FROM agents
+                LEFT JOIN identities ON identities.agent = agents.name
+                WHERE agents.name = ?
+                """,
+                (agent_name,),
+            ).fetchone()
             return agent_from_row(row) if row else None
 
     def next_message_seq(self) -> int:
@@ -960,6 +991,13 @@ class BrokerHandler(BaseHTTPRequestHandler):
                     return
                 agent = self.broker.announce(agent_name, body)
                 self.write_json({"agent": agent})
+            elif path.startswith("/identities/") and path.endswith("/contact"):
+                agent_name = clean_agent_name(urllib.parse.unquote(path.split("/")[2]))
+                if not self.can_act_as(credential, agent_name):
+                    self.write_json({"error": "credential cannot update this identity"}, HTTPStatus.FORBIDDEN)
+                    return
+                identity = self.broker.set_identity_contact(agent_name, str(body.get("contact") or ""))
+                self.write_json({"identity": identity})
             elif path == "/messages":
                 sender = clean_agent_name(str(body.get("sender") or ""))
                 if not self.can_act_as(credential, sender):
@@ -1310,6 +1348,33 @@ def cmd_register(args: argparse.Namespace) -> int:
     return 0
 
 
+def cmd_set_contact(args: argparse.Namespace) -> int:
+    config_path = resolve_config_path(args.config)
+    config = load_config(config_path)
+    agent = configured_agent(args)
+    contact = clean_contact_name(args.contact)
+    if not contact:
+        raise SystemExit("contact name is required")
+    result = make_client(args).request(
+        "POST",
+        f"/identities/{urllib.parse.quote(agent)}/contact",
+        {"contact": contact},
+    )
+    if config.get("agent") == agent:
+        saved = {
+            **config,
+            "contact": result["identity"].get("contact", contact),
+            "updated_at": now(),
+        }
+        save_config(saved, config_path)
+    if args.json:
+        emit(args, result)
+    else:
+        identity = result["identity"]
+        print(f"{identity['agent']} now belongs to contact {identity['contact']}.")
+    return 0
+
+
 def wait_for_broker(
     url: str,
     admin_token: str | None = None,
@@ -1394,6 +1459,11 @@ def register_with_invite(
         "contact": clean_contact_name(contact),
     }
     return client.request("POST", "/register", payload)["identity"]
+
+
+def set_identity_contact(client: Client, agent: str, contact: str) -> dict[str, Any]:
+    payload = {"contact": clean_contact_name(contact)}
+    return client.request("POST", f"/identities/{urllib.parse.quote(agent)}/contact", payload)["identity"]
 
 
 def create_invite(client: Client, label: str, max_uses: int, ttl: int, contact: str = "") -> dict[str, Any]:
@@ -1492,7 +1562,7 @@ def cmd_host(args: argparse.Namespace) -> int:
 
     admin_client = Client(local_url, token=admin_token, tls_fingerprint=tls_fingerprint)
     agent = clean_agent_name(args.agent or str(config.get("agent") or "") or default_agent_name())
-    host_contact = clean_contact_name(args.contact or str(config.get("contact") or ""))
+    host_contact = configured_contact(args, config)
     invite_contact = clean_contact_name(args.for_contact or "")
     api_key = str(config.get("api_key") or "") if config.get("agent") == agent else ""
     try:
@@ -1506,6 +1576,13 @@ def cmd_host(args: argparse.Namespace) -> int:
                 host_contact,
             )
             api_key = identity["api_key"]
+            host_contact = str(identity.get("contact") or host_contact)
+        elif host_contact:
+            identity = set_identity_contact(
+                Client(local_url, api_key=api_key, tls_fingerprint=tls_fingerprint),
+                agent,
+                host_contact,
+            )
             host_contact = str(identity.get("contact") or host_contact)
 
         invite_label = args.label or (f"join:{invite_contact}" if invite_contact else f"join:{agent}")
@@ -1570,6 +1647,8 @@ def cmd_host(args: argparse.Namespace) -> int:
         print(f"broker url: {local_url}")
         if tls_fingerprint:
             print(f"tls fingerprint: {tls_fingerprint}")
+        if host_contact:
+            print(f"host contact: {host_contact}")
         if invite_contact:
             print(f"setup code contact: {invite_contact}")
         elif urllib.parse.urlparse(public_url).scheme == "http" and args.host not in {"127.0.0.1", "localhost", "::1"}:
@@ -1935,7 +2014,7 @@ def build_parser() -> argparse.ArgumentParser:
     host.add_argument("--tls-days", type=int, default=365)
     host.add_argument("--agent")
     host.add_argument("--display-name")
-    host.add_argument("--contact", help="human/contact name for the host agent")
+    host.add_argument("--contact", "--owner", dest="contact", help="human/contact name for the host owner")
     host.add_argument("--for", dest="for_contact", help="human/contact name for the generated guest setup message")
     host.add_argument("--label", default="", help="label for the friend invite")
     host.add_argument("--max-uses", type=int, default=1)
@@ -1988,6 +2067,12 @@ def build_parser() -> argparse.ArgumentParser:
     register.add_argument("--display-name")
     register.add_argument("--contact", help="human/contact name this agent belongs to")
     register.set_defaults(func=cmd_register)
+
+    set_contact = subparsers.add_parser("set-contact", help="attach this agent identity to a human contact")
+    add_client_options(set_contact)
+    set_contact.add_argument("contact", help="human/contact name, for example Xuhui")
+    set_contact.add_argument("--agent")
+    set_contact.set_defaults(func=cmd_set_contact)
 
     whoami = subparsers.add_parser("whoami", help="show the current credential")
     add_client_options(whoami)

@@ -8,10 +8,10 @@ Run the broker on the shared host bound to localhost. Keep the admin token priva
 
 ```bash
 AM="${CODEX_HOME:-$HOME/.codex}/skills/agentmessenger/scripts/agentmessenger.py"
-python3 "$AM" host --agent host-codex
+python3 "$AM" host --contact Xuhui --agent host-codex
 ```
 
-`host` starts the broker in the background if needed, saves the host config, and prints a guest setup message with the AgentMessenger repo URL and an `am_join_...` setup code.
+`host` starts the broker in the background if needed, registers the host agent under the host contact, saves the host config, and prints a guest setup message with the AgentMessenger repo URL and an `am_join_...` setup code.
 
 From each local Codex session, tunnel to the broker:
 
@@ -45,6 +45,7 @@ Only bind to `0.0.0.0` on a trusted network or a locked-down security group. For
 
 ```bash
 python3 "$AM" host \
+  --contact Xuhui \
   --secure \
   --host 0.0.0.0 \
   --port 8765 \
@@ -77,6 +78,7 @@ Creating a new EC2 instance is a billable cloud action. Before doing it, confirm
 
 ```bash
 python3 "$AM" host \
+  --contact Xuhui \
   --secure \
   --host 0.0.0.0 \
   --public-url https://EC2_PUBLIC_DNS_OR_IP:8765 \
@@ -89,7 +91,7 @@ After the broker is reachable, use a fresh DB for one-off validation or unique a
 
 ```bash
 python3 "$AM" status
-python3 "$AM" host --no-start --agent smoke-a
+python3 "$AM" host --no-start --contact SmokeHost --agent smoke-a
 python3 "$AM" join "am_join_..." --agent smoke-b
 
 python3 "$AM" announce --agent smoke-a --summary "Smoke test A"
