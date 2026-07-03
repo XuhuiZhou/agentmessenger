@@ -4,7 +4,6 @@
 from __future__ import annotations
 
 import json
-import os
 import re
 import secrets
 import subprocess
@@ -18,9 +17,20 @@ ROOT = Path(__file__).resolve().parents[1]
 CLI = ROOT / "scripts" / "agentmessenger.py"
 
 
-def run_cli(url: str, token: str, *args: str, check: bool = True) -> subprocess.CompletedProcess[str]:
+def run_cli(
+    url: str,
+    *args: str,
+    admin_token: str | None = None,
+    api_key: str | None = None,
+    check: bool = True,
+) -> subprocess.CompletedProcess[str]:
+    command = [sys.executable, str(CLI), *args, "--url", url, "--json"]
+    if admin_token:
+        command.extend(["--admin-token", admin_token])
+    if api_key:
+        command.extend(["--api-key", api_key])
     return subprocess.run(
-        [sys.executable, str(CLI), *args, "--url", url, "--token", token, "--json"],
+        command,
         cwd=ROOT,
         check=check,
         text=True,
@@ -28,8 +38,13 @@ def run_cli(url: str, token: str, *args: str, check: bool = True) -> subprocess.
     )
 
 
-def json_cli(url: str, token: str, *args: str) -> dict:
-    result = run_cli(url, token, *args)
+def json_cli(
+    url: str,
+    *args: str,
+    admin_token: str | None = None,
+    api_key: str | None = None,
+) -> dict:
+    result = run_cli(url, *args, admin_token=admin_token, api_key=api_key)
     return json.loads(result.stdout)
 
 
@@ -47,22 +62,23 @@ def wait_for_server(proc: subprocess.Popen[str]) -> str:
     raise TimeoutError("server did not report its listening URL")
 
 
-def start_server(db_path: Path, token: str) -> tuple[subprocess.Popen[str], str]:
+def start_server(db_path: Path, admin_token: str | None = None) -> tuple[subprocess.Popen[str], str]:
+    command = [
+        sys.executable,
+        str(CLI),
+        "server",
+        "--host",
+        "127.0.0.1",
+        "--port",
+        "0",
+        "--db",
+        str(db_path),
+        "--quiet",
+    ]
+    if admin_token:
+        command.extend(["--admin-token", admin_token])
     proc = subprocess.Popen(
-        [
-            sys.executable,
-            str(CLI),
-            "server",
-            "--host",
-            "127.0.0.1",
-            "--port",
-            "0",
-            "--db",
-            str(db_path),
-            "--token",
-            token,
-            "--quiet",
-        ],
+        command,
         cwd=ROOT,
         text=True,
         stdout=subprocess.PIPE,
@@ -81,28 +97,96 @@ def stop_server(proc: subprocess.Popen[str]) -> None:
             proc.wait(timeout=5)
 
 
+def register_agent(url: str, admin_token: str, agent: str, invite_code: str) -> str:
+    identity = json_cli(
+        url,
+        "register",
+        "--agent",
+        agent,
+        "--display-name",
+        agent,
+        "--invite-code",
+        invite_code,
+    )["identity"]
+    assert identity["agent"] == agent
+    assert identity["api_key"].startswith("am_key_")
+    whoami = json_cli(url, "whoami", api_key=identity["api_key"])["credential"]
+    assert whoami["kind"] == "identity"
+    assert whoami["agent"] == agent
+    invites = json_cli(url, "invites", admin_token=admin_token)["invites"]
+    assert invites[0]["uses"] >= 1
+    return identity["api_key"]
+
+
 def main() -> int:
-    token = secrets.token_urlsafe(18)
+    admin_token = secrets.token_urlsafe(18)
     with tempfile.TemporaryDirectory(prefix="agentmessenger-test-") as temp_dir:
-        db_path = Path(temp_dir) / "broker.sqlite3"
-        proc, url = start_server(db_path, token)
+        open_db_path = Path(temp_dir) / "open.sqlite3"
+        proc, url = start_server(open_db_path)
         try:
-            health = json_cli(url, token, "status")
+            health = json_cli(url, "status")
+            assert health["ok"] is True
+            assert health["auth_required"] is False
+            json_cli(
+                url,
+                "announce",
+                "--agent",
+                "open-agent",
+                "--summary",
+                "Open local demo still works.",
+            )
+            agents = json_cli(url, "agents")["agents"]
+            assert [agent["name"] for agent in agents] == ["open-agent"]
+        finally:
+            stop_server(proc)
+
+        db_path = Path(temp_dir) / "broker.sqlite3"
+        proc, url = start_server(db_path, admin_token)
+        try:
+            health = json_cli(url, "status", admin_token=admin_token)
             assert health["ok"] is True
             assert health["storage"] == "sqlite"
+            assert health["credential"]["kind"] == "admin"
 
-            unauthorized = subprocess.run(
-                [sys.executable, str(CLI), "status", "--url", url, "--token", "wrong"],
-                cwd=ROOT,
-                text=True,
-                capture_output=True,
+            invite = json_cli(
+                url,
+                "invite",
+                "--label",
+                "self-test",
+                "--max-uses",
+                "2",
+                admin_token=admin_token,
+            )["invite"]
+            assert invite["code"].startswith("am_inv_")
+            assert invite["remaining_uses"] == 2
+
+            alice_key = register_agent(url, admin_token, "alice", invite["code"])
+            bob_key = register_agent(url, admin_token, "bob", invite["code"])
+
+            exhausted = run_cli(
+                url,
+                "register",
+                "--agent",
+                "charlie",
+                "--invite-code",
+                invite["code"],
+                check=False,
+            )
+            assert exhausted.returncode != 0
+            assert "403" in exhausted.stderr
+
+            unauthorized = run_cli(
+                url,
+                "agents",
+                "--api-key",
+                "wrong",
+                check=False,
             )
             assert unauthorized.returncode != 0
             assert "401" in unauthorized.stderr
 
             json_cli(
                 url,
-                token,
                 "announce",
                 "--agent",
                 "alice",
@@ -112,10 +196,23 @@ def main() -> int:
                 "Alice context: cache key changed.",
                 "--meta",
                 "role=backend",
+                api_key=alice_key,
             )
+            spoof = run_cli(
+                url,
+                "announce",
+                "--agent",
+                "bob",
+                "--summary",
+                "Alice should not be able to announce as Bob.",
+                api_key=alice_key,
+                check=False,
+            )
+            assert spoof.returncode != 0
+            assert "403" in spoof.stderr
+
             json_cli(
                 url,
-                token,
                 "announce",
                 "--agent",
                 "bob",
@@ -125,17 +222,17 @@ def main() -> int:
                 "Bob context: Settings > Cache reproduces it.",
                 "--meta",
                 "role=frontend",
+                api_key=bob_key,
             )
 
-            agents = json_cli(url, token, "agents")["agents"]
+            agents = json_cli(url, "agents", api_key=alice_key)["agents"]
             assert [agent["name"] for agent in agents] == ["alice", "bob"]
-            bob = json_cli(url, token, "fetch", "--agent", "bob")["agent"]
+            bob = json_cli(url, "fetch", "--agent", "bob", api_key=alice_key)["agent"]
             assert bob["metadata"]["role"] == "frontend"
             assert "Settings" in bob["context"]
 
             request = json_cli(
                 url,
-                token,
                 "ask",
                 "--from",
                 "alice",
@@ -143,10 +240,23 @@ def main() -> int:
                 "bob",
                 "--question",
                 "What UI context do you have?",
+                api_key=alice_key,
             )["message"]
             assert request["id"] == "m000001"
 
-            inbox = json_cli(url, token, "inbox", "--agent", "bob", "--peek")["messages"]
+            bob_spoof_read = run_cli(
+                url,
+                "inbox",
+                "--agent",
+                "alice",
+                "--peek",
+                api_key=bob_key,
+                check=False,
+            )
+            assert bob_spoof_read.returncode != 0
+            assert "403" in bob_spoof_read.stderr
+
+            inbox = json_cli(url, "inbox", "--agent", "bob", "--peek", api_key=bob_key)["messages"]
             assert len(inbox) == 1
             assert inbox[0]["kind"] == "context_request"
 
@@ -162,8 +272,8 @@ def main() -> int:
                     "5",
                     "--url",
                     url,
-                    "--token",
-                    token,
+                    "--api-key",
+                    alice_key,
                     "--json",
                 ],
                 cwd=ROOT,
@@ -174,7 +284,6 @@ def main() -> int:
             time.sleep(0.25)
             json_cli(
                 url,
-                token,
                 "reply",
                 "--from",
                 "bob",
@@ -186,6 +295,7 @@ def main() -> int:
                 "Use the Settings cache repro.",
                 "--context",
                 "Relevant file: src/settings/cache.ts",
+                api_key=bob_key,
             )
             stdout, stderr = waiter.communicate(timeout=10)
             assert waiter.returncode == 0, stderr
@@ -196,10 +306,12 @@ def main() -> int:
         finally:
             stop_server(proc)
 
-        proc, url = start_server(db_path, token)
+        proc, url = start_server(db_path, admin_token)
         try:
-            agents = json_cli(url, token, "agents")["agents"]
+            agents = json_cli(url, "agents", api_key=alice_key)["agents"]
             assert {agent["name"] for agent in agents} == {"alice", "bob"}
+            whoami = json_cli(url, "whoami", api_key=bob_key)["credential"]
+            assert whoami["agent"] == "bob"
         finally:
             stop_server(proc)
 

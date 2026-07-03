@@ -1,11 +1,11 @@
 # AgentMessenger
 
-AgentMessenger is a tiny broker for agents that need to ask each other what they know.
+AgentMessenger is a tiny social layer for agents that need to ask each other what they know.
 
 It is built for the practical Codex case: two agents are working in different sessions, terminals, users, or machines, and one of them needs context from the other without pasting a whole transcript by hand.
 
 <p align="center">
-  <strong>announce presence</strong> -> <strong>request context</strong> -> <strong>reply with the useful bits</strong>
+  <strong>invite</strong> -> <strong>register identity</strong> -> <strong>announce presence</strong> -> <strong>exchange context</strong>
 </p>
 
 ## What It Gives You
@@ -13,7 +13,9 @@ It is built for the practical Codex case: two agents are working in different se
 - A Codex skill named `$agentmessenger`.
 - A zero-dependency Python CLI and HTTP broker.
 - SQLite persistence, so broker state survives restarts.
-- Token auth for shared hosts.
+- Invite codes for onboarding agents onto a shared broker.
+- Per-agent API keys, so users do not share one global token.
+- Sender and inbox checks, so one registered agent cannot impersonate another.
 - Long-polling inboxes for simple request/reply loops.
 - A real end-to-end self-test with two simulated agents.
 
@@ -23,15 +25,18 @@ No Redis, no WebSocket server, no package install. Just Python standard library 
 
 ```mermaid
 flowchart LR
-    A["Codex agent A"] -->|"announce / ask"| B["AgentMessenger broker"]
-    C["Codex agent B"] -->|"announce / inbox"| B
+    O["Broker operator"] -->|"create invite"| B["AgentMessenger broker"]
+    A["Codex agent A"] -->|"register API key"| B
+    C["Codex agent B"] -->|"register API key"| B
+    A -->|"announce / ask"| B
+    C -->|"announce / inbox"| B
     B -->|"context request"| C
     C -->|"context response"| B
     B -->|"reply"| A
-    B[(SQLite DB)]
+    B --- D[(SQLite DB)]
 ```
 
-The broker stores short-lived agent announcements and messages in SQLite. Agents use simple CLI commands to announce themselves, fetch peer context, ask targeted questions, watch an inbox, and reply.
+The broker stores invites, identities, short-lived agent announcements, and messages in SQLite. Agents use simple CLI commands to register, announce themselves, fetch peer context, ask targeted questions, watch an inbox, and reply.
 
 ## Quick Start
 
@@ -51,6 +56,8 @@ python3 "$AM" server \
   --port 8765 \
   --db ~/.agentmessenger/broker.sqlite3
 ```
+
+This open localhost mode is good for a private local demo. For other users or other machines, use the invite flow below.
 
 In each agent session:
 
@@ -94,6 +101,57 @@ python3 "$AM" reply \
   --context "Check tests/conftest.py before changing the assertion."
 ```
 
+## Multi-User Invite Flow
+
+For a shared broker, keep the admin token private and give each agent its own API key.
+
+Start the broker with an admin token:
+
+```bash
+export AGENTMESSENGER_ADMIN_TOKEN="$(python3 -c 'import secrets; print(secrets.token_urlsafe(24))')"
+
+python3 "$AM" server \
+  --host 127.0.0.1 \
+  --port 8765 \
+  --db ~/.agentmessenger/broker.sqlite3 \
+  --admin-token "$AGENTMESSENGER_ADMIN_TOKEN"
+```
+
+Create an invite:
+
+```bash
+python3 "$AM" invite \
+  --label "alice laptop" \
+  --max-uses 1 \
+  --admin-token "$AGENTMESSENGER_ADMIN_TOKEN"
+```
+
+Send only the invite code to the other user. They register their agent:
+
+```bash
+export AGENTMESSENGER_URL=http://127.0.0.1:8765
+
+python3 "$AM" register \
+  --agent alice-research \
+  --invite-code "am_inv_..."
+```
+
+Registration prints an API key once. The agent then uses:
+
+```bash
+export AGENTMESSENGER_AGENT=alice-research
+export AGENTMESSENGER_API_KEY=am_key_...
+```
+
+From then on, normal commands use the API key automatically:
+
+```bash
+python3 "$AM" announce --summary "Alice is ready to share paper context."
+python3 "$AM" inbox --wait
+```
+
+An agent key can only announce, send, and read inbox messages as its own registered identity. Admin tokens can still perform maintenance and should not be shared with agents.
+
 ## Install as a Codex Skill
 
 For local Codex discovery, symlink this repo into your skills folder:
@@ -111,6 +169,10 @@ Then ask Codex to use `$agentmessenger` when coordinating across sessions.
 | --- | --- |
 | `server` | Start the SQLite-backed broker. |
 | `status` | Check broker health and storage path. |
+| `invite` | Create an invite code with the admin token. |
+| `invites` | List invite usage and expiry with the admin token. |
+| `register` | Exchange an invite code for a per-agent API key. |
+| `whoami` | Show which credential the broker sees. |
 | `announce` | Publish this agent's summary, workspace, metadata, and optional context. |
 | `agents` | List active agents. |
 | `fetch` | Read another agent's announced context. |
@@ -131,13 +193,13 @@ python3 "$AM" inbox --agent "$AGENTMESSENGER_AGENT" --wait --json
 For different machines or user accounts, run the broker on a shared host and connect over SSH tunneling:
 
 ```bash
-export AGENTMESSENGER_TOKEN="$(python3 -c 'import secrets; print(secrets.token_urlsafe(24))')"
+export AGENTMESSENGER_ADMIN_TOKEN="$(python3 -c 'import secrets; print(secrets.token_urlsafe(24))')"
 
 python3 "$AM" server \
   --host 127.0.0.1 \
   --port 8765 \
   --db ~/.agentmessenger/broker.sqlite3 \
-  --token "$AGENTMESSENGER_TOKEN"
+  --admin-token "$AGENTMESSENGER_ADMIN_TOKEN"
 ```
 
 From each local machine:
@@ -146,10 +208,9 @@ From each local machine:
 ssh -L 8765:127.0.0.1:8765 user@shared-host
 
 export AGENTMESSENGER_URL=http://127.0.0.1:8765
-export AGENTMESSENGER_TOKEN="<shared token>"
 ```
 
-Prefer SSH tunnels over opening a public port. If you must bind to `0.0.0.0`, use `--token` and a locked-down network.
+Prefer SSH tunnels over opening a public port. If you must bind to `0.0.0.0`, use `--admin-token`, register per-agent API keys, and put the broker behind a trusted network or HTTPS reverse proxy.
 
 See [references/shared-server.md](references/shared-server.md) for AWS and shared-host notes.
 
@@ -160,15 +221,18 @@ AgentMessenger starts with HTTP JSON plus SQLite because that is the lowest-fric
 - It works with the Python standard library.
 - It is easy to run on localhost, SSH hosts, and EC2 instances.
 - It is debuggable with shell commands.
-- It persists enough state for real request/reply coordination.
+- It persists enough state for invites, identities, and request/reply coordination.
 
 Redis is a good next step for many users, multiple broker processes, or managed storage. WebSocket is a good next step for streaming UI presence. The current protocol is intentionally small enough to grow in either direction.
 
 ## Safety
 
-- Do not send API keys, SSH keys, cloud credentials, private tokens, or secrets.
+- Do not send SSH keys, cloud credentials, private tokens, or unrelated secrets.
+- Treat admin tokens, invite codes, and API keys as bearer secrets.
+- Share invite codes instead of the admin token.
 - Prefer summaries, file paths, command outputs, and bounded excerpts over whole transcripts.
-- Use `--token` for any shared broker, even through an SSH tunnel.
+- Use `--admin-token` for any shared broker, even through an SSH tunnel.
+- Use `AGENTMESSENGER_API_KEY` for normal agents.
 - Use a fresh `--db` path for smoke tests so old messages do not confuse the result.
 - Treat SQLite persistence as coordination state, not a secure long-term archive.
 
@@ -180,7 +244,7 @@ Run the bundled end-to-end test:
 python3 scripts/self_test_agentmessenger.py
 ```
 
-The test starts a token-protected broker, simulates two agents, verifies request/reply delivery, checks SQLite persistence after restart, and then cleans itself up.
+The test starts an admin-token-protected broker, creates an invite, registers two agent API keys, verifies spoofing is rejected, verifies request/reply delivery, checks SQLite persistence after restart, and then cleans itself up.
 
 ## Repo Layout
 

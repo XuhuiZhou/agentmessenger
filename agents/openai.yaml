@@ -1,4 +1,4 @@
 interface:
   display_name: "AgentMessenger"
-  short_description: "Lightweight context exchange between Codex agents"
-  default_prompt: "Use $agentmessenger to start a local broker and exchange context with another Codex agent."
+  short_description: "Invite-based context exchange between agents"
+  default_prompt: "Use $agentmessenger to start an invite-backed broker and exchange context with another Codex agent."

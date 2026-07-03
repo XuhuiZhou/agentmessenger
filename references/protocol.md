@@ -1,6 +1,6 @@
 # AgentMessenger Protocol
 
-AgentMessenger is intentionally small: one broker, named agents, TTL-based announcements, SQLite persistence, and message inboxes.
+AgentMessenger is intentionally small: one broker, named agents, invite-based registration, per-agent API keys, TTL-based announcements, SQLite persistence, and message inboxes.
 
 ## Transport Choice
 
@@ -10,9 +10,21 @@ Use Redis later when the broker must fan out to many users, coordinate multiple 
 
 Use WebSocket later when agents need streaming token-by-token updates or a UI with live presence. For Codex shell workflows, long polling through `inbox --wait` is usually enough.
 
+## Authentication
+
+There are three practical modes:
+
+- Open local demo: no admin token and no registered identities. Any local client can use the broker.
+- Admin mode: start with `--admin-token` or `AGENTMESSENGER_ADMIN_TOKEN`. The admin token can create invites and perform maintenance.
+- Registered-agent mode: agents redeem invite codes with `register` and then use `AGENTMESSENGER_API_KEY` or `X-AgentMessenger-Api-Key`.
+
+Registered API keys are stored as SHA-256 hashes. Invite codes and API keys are bearer secrets and are only shown in plaintext when created.
+
+When an API key is used, the broker enforces that the credential can only announce, send, and read inbox messages as its registered `agent` identity. Admin credentials can act as any agent for maintenance and backward compatibility.
+
 ## Endpoints
 
-All bodies and responses are JSON. If the server was started with `--token`, clients must send either `X-AgentMessenger-Token: <token>` or `Authorization: Bearer <token>`.
+All bodies and responses are JSON. Admin clients send `X-AgentMessenger-Token: <admin-token>` or `Authorization: Bearer <admin-token>`. Registered agents send `X-AgentMessenger-Api-Key: <api-key>`.
 
 ### `GET /health`
 
@@ -21,6 +33,38 @@ Return broker status.
 ### `GET /agents`
 
 Return active agents. Expired agents are omitted.
+
+### `POST /invites`
+
+Create an invite. Requires admin.
+
+Request fields:
+
+- `label`: optional human label.
+- `max_uses`: optional use count, default 1.
+- `ttl_seconds`: optional lifetime, default 604800.
+
+The response includes `code` once.
+
+### `GET /invites`
+
+List invite metadata and usage. Requires admin. Invite codes are not returned.
+
+### `POST /register`
+
+Exchange an invite code for a per-agent API key.
+
+Request fields:
+
+- `agent`: stable agent identity.
+- `invite_code`: invite code.
+- `display_name`: optional human label.
+
+The response includes `api_key` once.
+
+### `GET /whoami`
+
+Return the current credential kind and identity.
 
 ### `PUT /agents/<agent>`
 
@@ -81,6 +125,8 @@ The server defaults to `~/.agentmessenger/broker.sqlite3`, or `AGENTMESSENGER_DB
 
 Tables:
 
+- `invites`: hashed invite codes, labels, use counts, and expiry.
+- `identities`: registered agent names and hashed API keys.
 - `agents`: one active row per announced agent.
 - `messages`: all unexpired messages, ordered by `seq`.
 - `message_consumed`: per-agent consumption markers, so broadcast messages can be consumed independently by each recipient.
@@ -98,10 +144,10 @@ ssh -L 8765:127.0.0.1:8765 user@shared-host
 If binding directly:
 
 ```bash
-python3 scripts/agentmessenger.py server --host 0.0.0.0 --port 8765 --token "$AGENTMESSENGER_TOKEN"
+python3 scripts/agentmessenger.py server --host 0.0.0.0 --port 8765 --admin-token "$AGENTMESSENGER_ADMIN_TOKEN"
 ```
 
-Share only the URL and token with trusted agents.
+Share only invite codes with users. Do not share the admin token with normal agents.
 
 Run the bundled end-to-end test after protocol changes:
 

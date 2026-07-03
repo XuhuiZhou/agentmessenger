@@ -4,6 +4,8 @@
 from __future__ import annotations
 
 import argparse
+import hashlib
+import hmac
 import json
 import os
 import re
@@ -20,13 +22,21 @@ from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from typing import Any
+import secrets
 
 
 DEFAULT_URL = "http://127.0.0.1:8765"
 DEFAULT_DB = "~/.agentmessenger/broker.sqlite3"
 DEFAULT_TTL = 3600
+DEFAULT_INVITE_TTL = 7 * 24 * 3600
 MAX_WAIT_SECONDS = 120
-VERSION = "0.2.0"
+VERSION = "0.3.0"
+
+
+class BrokerError(Exception):
+    def __init__(self, message: str, status: HTTPStatus = HTTPStatus.BAD_REQUEST) -> None:
+        super().__init__(message)
+        self.status = status
 
 
 def now() -> float:
@@ -99,6 +109,29 @@ def json_object(value: str | None) -> dict[str, Any]:
     return loaded if isinstance(loaded, dict) else {}
 
 
+def hash_secret(value: str) -> str:
+    return hashlib.sha256(value.encode("utf-8")).hexdigest()
+
+
+def same_secret(left: str | None, right: str | None) -> bool:
+    if not left or not right:
+        return False
+    return hmac.compare_digest(left, right)
+
+
+def generate_invite_code() -> str:
+    return f"am_inv_{secrets.token_urlsafe(24)}"
+
+
+def generate_api_key() -> str:
+    return f"am_key_{secrets.token_urlsafe(32)}"
+
+
+def ttl_expires_at(ttl_seconds: int | None) -> float:
+    ttl = DEFAULT_TTL if ttl_seconds is None else int(ttl_seconds)
+    return now() + ttl
+
+
 class BrokerState:
     def __init__(self, db_path: str | None = None) -> None:
         self.db_path = resolve_db_path(db_path)
@@ -109,6 +142,7 @@ class BrokerState:
         self.conn = sqlite3.connect(self.db_path, check_same_thread=False, isolation_level=None)
         self.conn.row_factory = sqlite3.Row
         self.conn.execute("PRAGMA busy_timeout = 5000")
+        self.conn.execute("PRAGMA foreign_keys = ON")
         if self.db_path != ":memory:":
             self.conn.execute("PRAGMA journal_mode = WAL")
         self.init_schema()
@@ -149,10 +183,33 @@ class BrokerState:
                     FOREIGN KEY (message_id) REFERENCES messages(id) ON DELETE CASCADE
                 );
 
+                CREATE TABLE IF NOT EXISTS invites (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    code_hash TEXT UNIQUE NOT NULL,
+                    label TEXT NOT NULL DEFAULT '',
+                    max_uses INTEGER NOT NULL DEFAULT 1,
+                    uses INTEGER NOT NULL DEFAULT 0,
+                    created_at REAL NOT NULL,
+                    expires_at REAL NOT NULL,
+                    revoked_at REAL
+                );
+
+                CREATE TABLE IF NOT EXISTS identities (
+                    agent TEXT PRIMARY KEY,
+                    display_name TEXT NOT NULL DEFAULT '',
+                    api_key_hash TEXT UNIQUE NOT NULL,
+                    invite_id INTEGER,
+                    created_at REAL NOT NULL,
+                    last_seen_at REAL,
+                    FOREIGN KEY (invite_id) REFERENCES invites(id)
+                );
+
                 CREATE INDEX IF NOT EXISTS idx_messages_recipient_seq
                     ON messages(recipient, seq);
                 CREATE INDEX IF NOT EXISTS idx_messages_reply
                     ON messages(in_reply_to);
+                CREATE INDEX IF NOT EXISTS idx_identities_api_key
+                    ON identities(api_key_hash);
                 """
             )
 
@@ -169,6 +226,104 @@ class BrokerState:
             (current,),
         )
         self.conn.execute("DELETE FROM messages WHERE expires_at <= ?", (current,))
+
+    def has_identities(self) -> bool:
+        with self.lock:
+            row = self.conn.execute("SELECT 1 FROM identities LIMIT 1").fetchone()
+            return row is not None
+
+    def create_invite(self, label: str, max_uses: int, ttl_seconds: int) -> dict[str, Any]:
+        if max_uses < 1:
+            raise BrokerError("max_uses must be at least 1")
+        code = generate_invite_code()
+        timestamp = now()
+        with self.lock:
+            cursor = self.conn.execute(
+                """
+                INSERT INTO invites
+                    (code_hash, label, max_uses, uses, created_at, expires_at)
+                VALUES (?, ?, ?, 0, ?, ?)
+                """,
+                (hash_secret(code), label, max_uses, timestamp, timestamp + ttl_seconds),
+            )
+            row = self.conn.execute("SELECT * FROM invites WHERE id = ?", (cursor.lastrowid,)).fetchone()
+            invite = invite_from_row(row)
+            invite["code"] = code
+            return invite
+
+    def list_invites(self) -> list[dict[str, Any]]:
+        with self.lock:
+            rows = self.conn.execute("SELECT * FROM invites ORDER BY id DESC").fetchall()
+            return [invite_from_row(row) for row in rows]
+
+    def register_identity(self, agent_name: str, invite_code: str, display_name: str) -> dict[str, Any]:
+        agent_name = clean_agent_name(agent_name)
+        timestamp = now()
+        api_key = generate_api_key()
+        with self.lock:
+            invite = self.conn.execute(
+                "SELECT * FROM invites WHERE code_hash = ?",
+                (hash_secret(invite_code),),
+            ).fetchone()
+            if invite is None:
+                raise BrokerError("invalid invite code", HTTPStatus.FORBIDDEN)
+            invite_data = invite_from_row(invite)
+            if invite_data["revoked_at"] is not None:
+                raise BrokerError("invite has been revoked", HTTPStatus.FORBIDDEN)
+            if invite_data["expires_at"] <= timestamp:
+                raise BrokerError("invite has expired", HTTPStatus.FORBIDDEN)
+            if invite_data["uses"] >= invite_data["max_uses"]:
+                raise BrokerError("invite has no remaining uses", HTTPStatus.FORBIDDEN)
+            existing = self.conn.execute("SELECT agent FROM identities WHERE agent = ?", (agent_name,)).fetchone()
+            if existing is not None:
+                raise BrokerError("agent identity already exists", HTTPStatus.CONFLICT)
+            self.conn.execute(
+                """
+                INSERT INTO identities
+                    (agent, display_name, api_key_hash, invite_id, created_at, last_seen_at)
+                VALUES (?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    agent_name,
+                    display_name,
+                    hash_secret(api_key),
+                    invite_data["id"],
+                    timestamp,
+                    timestamp,
+                ),
+            )
+            self.conn.execute(
+                "UPDATE invites SET uses = uses + 1 WHERE id = ?",
+                (invite_data["id"],),
+            )
+            identity = self.lookup_identity(api_key)
+            if identity is None:
+                raise BrokerError("failed to create identity")
+            identity["api_key"] = api_key
+            return identity
+
+    def lookup_identity(self, api_key: str | None) -> dict[str, Any] | None:
+        if not api_key:
+            return None
+        key_hash = hash_secret(api_key)
+        with self.lock:
+            row = self.conn.execute(
+                "SELECT * FROM identities WHERE api_key_hash = ?",
+                (key_hash,),
+            ).fetchone()
+            if row is None:
+                return None
+            timestamp = now()
+            self.conn.execute(
+                "UPDATE identities SET last_seen_at = ? WHERE agent = ?",
+                (timestamp, row["agent"]),
+            )
+            return identity_from_row(row, last_seen_at=timestamp)
+
+    def list_identities(self) -> list[dict[str, Any]]:
+        with self.lock:
+            rows = self.conn.execute("SELECT * FROM identities ORDER BY agent").fetchall()
+            return [identity_from_row(row) for row in rows]
 
     def announce(self, agent_name: str, payload: dict[str, Any]) -> dict[str, Any]:
         with self.condition:
@@ -345,6 +500,29 @@ def message_from_row(row: sqlite3.Row) -> dict[str, Any]:
     }
 
 
+def invite_from_row(row: sqlite3.Row) -> dict[str, Any]:
+    return {
+        "id": row["id"],
+        "label": row["label"],
+        "max_uses": row["max_uses"],
+        "uses": row["uses"],
+        "remaining_uses": max(0, row["max_uses"] - row["uses"]),
+        "created_at": row["created_at"],
+        "expires_at": row["expires_at"],
+        "revoked_at": row["revoked_at"],
+    }
+
+
+def identity_from_row(row: sqlite3.Row, last_seen_at: float | None = None) -> dict[str, Any]:
+    return {
+        "agent": row["agent"],
+        "display_name": row["display_name"],
+        "invite_id": row["invite_id"],
+        "created_at": row["created_at"],
+        "last_seen_at": row["last_seen_at"] if last_seen_at is None else last_seen_at,
+    }
+
+
 class BrokerHandler(BaseHTTPRequestHandler):
     server_version = f"AgentMessenger/{VERSION}"
 
@@ -353,59 +531,75 @@ class BrokerHandler(BaseHTTPRequestHandler):
         return self.server.broker  # type: ignore[attr-defined]
 
     @property
-    def token(self) -> str | None:
-        return self.server.token  # type: ignore[attr-defined]
+    def admin_token(self) -> str | None:
+        return self.server.admin_token  # type: ignore[attr-defined]
 
     def log_message(self, fmt: str, *args: Any) -> None:
         if not getattr(self.server, "quiet", False):  # type: ignore[attr-defined]
             super().log_message(fmt, *args)
 
     def do_GET(self) -> None:
-        if not self.authorized():
-            self.write_json({"error": "unauthorized"}, HTTPStatus.UNAUTHORIZED)
-            return
         parsed = urllib.parse.urlparse(self.path)
         path = parsed.path.rstrip("/") or "/"
         query = urllib.parse.parse_qs(parsed.query)
         try:
             if path == "/health":
-                self.write_json(
-                    {
-                        "ok": True,
-                        "service": "agentmessenger",
-                        "version": VERSION,
-                        "storage": "sqlite",
-                        "db": self.broker.db_path,
-                        "time": now(),
-                    }
-                )
-            elif path == "/agents":
-                self.write_json({"agents": self.broker.list_agents()})
-            elif path.startswith("/agents/") and path.endswith("/context"):
-                agent_name = urllib.parse.unquote(path.split("/")[2])
-                agent = self.broker.fetch_agent(agent_name)
-                if agent is None:
-                    self.write_json({"error": "agent not found"}, HTTPStatus.NOT_FOUND)
-                else:
-                    self.write_json({"agent": agent})
-            elif path == "/messages":
-                agent_name = clean_agent_name(str(one(query, "agent", default_agent_name())))
-                wait_seconds = float(str(one(query, "wait", "0")))
-                since = parse_since(one(query, "since", "0"))
-                consume = one(query, "consume", "0") in {"1", "true", "yes"}
-                include_consumed = one(query, "include_consumed", "0") in {"1", "true", "yes"}
-                in_reply_to = one(query, "in_reply_to", None)
-                messages = self.broker.get_messages(
-                    agent_name,
-                    since=since,
-                    wait_seconds=wait_seconds,
-                    consume=consume,
-                    include_consumed=include_consumed,
-                    in_reply_to=in_reply_to,
-                )
-                self.write_json({"messages": messages})
+                credential = self.credential()
+                payload = {
+                    "ok": True,
+                    "service": "agentmessenger",
+                    "version": VERSION,
+                    "storage": "sqlite",
+                    "auth_required": self.admin_token is not None or self.broker.has_identities(),
+                    "time": now(),
+                }
+                if credential is not None:
+                    payload["db"] = self.broker.db_path
+                    payload["credential"] = credential_public(credential)
+                self.write_json(payload)
+            elif path == "/whoami":
+                credential = self.require_credential()
+                if credential is not None:
+                    self.write_json({"credential": credential_public(credential)})
+            elif path == "/invites":
+                if self.require_admin() is not None:
+                    self.write_json({"invites": self.broker.list_invites()})
             else:
-                self.write_json({"error": "not found"}, HTTPStatus.NOT_FOUND)
+                credential = self.require_credential()
+                if credential is None:
+                    return
+                if path == "/agents":
+                    self.write_json({"agents": self.broker.list_agents()})
+                elif path.startswith("/agents/") and path.endswith("/context"):
+                    agent_name = urllib.parse.unquote(path.split("/")[2])
+                    agent = self.broker.fetch_agent(agent_name)
+                    if agent is None:
+                        self.write_json({"error": "agent not found"}, HTTPStatus.NOT_FOUND)
+                    else:
+                        self.write_json({"agent": agent})
+                elif path == "/messages":
+                    agent_name = clean_agent_name(str(one(query, "agent", default_agent_name())))
+                    if not self.can_act_as(credential, agent_name):
+                        self.write_json({"error": "credential cannot read this inbox"}, HTTPStatus.FORBIDDEN)
+                        return
+                    wait_seconds = float(str(one(query, "wait", "0")))
+                    since = parse_since(one(query, "since", "0"))
+                    consume = one(query, "consume", "0") in {"1", "true", "yes"}
+                    include_consumed = one(query, "include_consumed", "0") in {"1", "true", "yes"}
+                    in_reply_to = one(query, "in_reply_to", None)
+                    messages = self.broker.get_messages(
+                        agent_name,
+                        since=since,
+                        wait_seconds=wait_seconds,
+                        consume=consume,
+                        include_consumed=include_consumed,
+                        in_reply_to=in_reply_to,
+                    )
+                    self.write_json({"messages": messages})
+                else:
+                    self.write_json({"error": "not found"}, HTTPStatus.NOT_FOUND)
+        except BrokerError as exc:
+            self.write_json({"error": str(exc)}, exc.status)
         except Exception as exc:  # pragma: no cover - surfaced to CLI.
             self.write_json({"error": str(exc)}, HTTPStatus.BAD_REQUEST)
 
@@ -416,31 +610,93 @@ class BrokerHandler(BaseHTTPRequestHandler):
         self.handle_write()
 
     def handle_write(self) -> None:
-        if not self.authorized():
-            self.write_json({"error": "unauthorized"}, HTTPStatus.UNAUTHORIZED)
-            return
         parsed = urllib.parse.urlparse(self.path)
         path = parsed.path.rstrip("/") or "/"
         try:
             body = self.read_json()
+            if path == "/register":
+                agent_name = clean_agent_name(str(body.get("agent") or ""))
+                invite_code = str(body.get("invite_code") or "")
+                display_name = str(body.get("display_name") or agent_name)
+                if not agent_name:
+                    raise BrokerError("agent is required")
+                if not invite_code:
+                    raise BrokerError("invite_code is required")
+                identity = self.broker.register_identity(agent_name, invite_code, display_name)
+                self.write_json({"identity": identity})
+                return
+            if path == "/invites":
+                if self.require_admin() is None:
+                    return
+                label = str(body.get("label") or "")
+                max_uses = int(body.get("max_uses") or 1)
+                ttl_seconds = int(body.get("ttl_seconds") or DEFAULT_INVITE_TTL)
+                invite = self.broker.create_invite(label, max_uses, ttl_seconds)
+                self.write_json({"invite": invite})
+                return
+
+            credential = self.require_credential()
+            if credential is None:
+                return
             if path.startswith("/agents/"):
                 agent_name = clean_agent_name(urllib.parse.unquote(path.split("/")[2]))
+                if not self.can_act_as(credential, agent_name):
+                    self.write_json({"error": "credential cannot announce as this agent"}, HTTPStatus.FORBIDDEN)
+                    return
                 agent = self.broker.announce(agent_name, body)
                 self.write_json({"agent": agent})
             elif path == "/messages":
+                sender = clean_agent_name(str(body.get("sender") or ""))
+                if not self.can_act_as(credential, sender):
+                    self.write_json({"error": "credential cannot send as this agent"}, HTTPStatus.FORBIDDEN)
+                    return
                 message = self.broker.send_message(body)
                 self.write_json({"message": message})
             else:
                 self.write_json({"error": "not found"}, HTTPStatus.NOT_FOUND)
+        except BrokerError as exc:
+            self.write_json({"error": str(exc)}, exc.status)
         except Exception as exc:  # pragma: no cover - surfaced to CLI.
             self.write_json({"error": str(exc)}, HTTPStatus.BAD_REQUEST)
 
-    def authorized(self) -> bool:
-        if not self.token:
+    def credential(self) -> dict[str, Any] | None:
+        token = self.token_header()
+        if same_secret(token, self.admin_token):
+            return {"kind": "admin"}
+        api_key = self.headers.get("X-AgentMessenger-Api-Key") or token
+        identity = self.broker.lookup_identity(api_key)
+        if identity is not None:
+            return {"kind": "identity", **identity}
+        if self.admin_token is None and not self.broker.has_identities():
+            return {"kind": "public"}
+        return None
+
+    def require_credential(self) -> dict[str, Any] | None:
+        credential = self.credential()
+        if credential is None:
+            self.write_json({"error": "unauthorized"}, HTTPStatus.UNAUTHORIZED)
+        return credential
+
+    def require_admin(self) -> dict[str, Any] | None:
+        credential = self.credential()
+        if credential is None:
+            self.write_json({"error": "unauthorized"}, HTTPStatus.UNAUTHORIZED)
+            return None
+        if credential["kind"] != "admin":
+            self.write_json({"error": "admin token required"}, HTTPStatus.FORBIDDEN)
+            return None
+        return credential
+
+    def can_act_as(self, credential: dict[str, Any], agent_name: str) -> bool:
+        if credential["kind"] in {"admin", "public"}:
             return True
+        return credential["kind"] == "identity" and credential["agent"] == agent_name
+
+    def token_header(self) -> str | None:
         bearer = self.headers.get("Authorization", "")
-        header_token = self.headers.get("X-AgentMessenger-Token")
-        return header_token == self.token or bearer == f"Bearer {self.token}"
+        if bearer.startswith("Bearer "):
+            return bearer.removeprefix("Bearer ").strip()
+        return self.headers.get("X-AgentMessenger-Token")
 
     def read_json(self) -> dict[str, Any]:
         length = int(self.headers.get("Content-Length", "0"))
@@ -458,6 +714,10 @@ class BrokerHandler(BaseHTTPRequestHandler):
         self.wfile.write(raw)
 
 
+def credential_public(credential: dict[str, Any]) -> dict[str, Any]:
+    return {key: value for key, value in credential.items() if key != "api_key"}
+
+
 def one(query: dict[str, list[str]], key: str, default: str | None = "") -> str | None:
     values = query.get(key)
     if not values:
@@ -470,7 +730,12 @@ def run_server(args: argparse.Namespace) -> int:
     broker = BrokerState(db_path)
     server = ThreadingHTTPServer((args.host, args.port), BrokerHandler)
     server.broker = broker  # type: ignore[attr-defined]
-    server.token = args.token or os.environ.get("AGENTMESSENGER_TOKEN")  # type: ignore[attr-defined]
+    server.admin_token = (
+        args.admin_token
+        or args.token
+        or os.environ.get("AGENTMESSENGER_ADMIN_TOKEN")
+        or os.environ.get("AGENTMESSENGER_TOKEN")
+    )  # type: ignore[attr-defined]
     server.quiet = args.quiet  # type: ignore[attr-defined]
 
     def stop(_signum: int, _frame: Any) -> None:
@@ -482,10 +747,10 @@ def run_server(args: argparse.Namespace) -> int:
     url = f"http://{display_host}:{port}"
     print(f"AgentMessenger broker listening at {url}", flush=True)
     print(f"SQLite database: {broker.db_path}", flush=True)
-    if server.token:  # type: ignore[attr-defined]
-        print("Token auth is enabled. Set AGENTMESSENGER_TOKEN in each client session.", flush=True)
+    if server.admin_token:  # type: ignore[attr-defined]
+        print("Admin token is enabled. Use it to create invites; agents should register API keys.", flush=True)
     elif args.host not in {"127.0.0.1", "localhost", "::1"}:
-        print("Warning: no token configured for a non-localhost bind.", flush=True)
+        print("Warning: no admin token configured for a non-localhost bind.", flush=True)
     try:
         server.serve_forever()
     except KeyboardInterrupt:
@@ -497,9 +762,16 @@ def run_server(args: argparse.Namespace) -> int:
 
 
 class Client:
-    def __init__(self, url: str, token: str | None = None, timeout: float = MAX_WAIT_SECONDS + 10) -> None:
+    def __init__(
+        self,
+        url: str,
+        token: str | None = None,
+        api_key: str | None = None,
+        timeout: float = MAX_WAIT_SECONDS + 10,
+    ) -> None:
         self.url = url.rstrip("/")
         self.token = token
+        self.api_key = api_key
         self.timeout = timeout
 
     def request(self, method: str, path: str, body: dict[str, Any] | None = None) -> dict[str, Any]:
@@ -510,6 +782,8 @@ class Client:
             headers["Content-Type"] = "application/json"
         if self.token:
             headers["X-AgentMessenger-Token"] = self.token
+        if self.api_key:
+            headers["X-AgentMessenger-Api-Key"] = self.api_key
         request = urllib.request.Request(f"{self.url}{path}", data=data, headers=headers, method=method)
         try:
             with urllib.request.urlopen(request, timeout=self.timeout) as response:
@@ -522,9 +796,11 @@ class Client:
 
 
 def make_client(args: argparse.Namespace, timeout: float = MAX_WAIT_SECONDS + 10) -> Client:
+    admin_token = getattr(args, "admin_token", None) or os.environ.get("AGENTMESSENGER_ADMIN_TOKEN")
     return Client(
         args.url or os.environ.get("AGENTMESSENGER_URL", DEFAULT_URL),
-        args.token or os.environ.get("AGENTMESSENGER_TOKEN"),
+        token=getattr(args, "token", None) or admin_token or os.environ.get("AGENTMESSENGER_TOKEN"),
+        api_key=getattr(args, "api_key", None) or os.environ.get("AGENTMESSENGER_API_KEY"),
         timeout=timeout,
     )
 
@@ -532,6 +808,77 @@ def make_client(args: argparse.Namespace, timeout: float = MAX_WAIT_SECONDS + 10
 def cmd_status(args: argparse.Namespace) -> int:
     result = make_client(args).request("GET", "/health")
     emit(args, result, "AgentMessenger broker is reachable.")
+    return 0
+
+
+def cmd_invite(args: argparse.Namespace) -> int:
+    payload = {
+        "label": args.label or "",
+        "max_uses": args.max_uses,
+        "ttl_seconds": args.ttl,
+    }
+    result = make_client(args).request("POST", "/invites", payload)
+    if args.json:
+        emit(args, result)
+    else:
+        invite = result["invite"]
+        print(f"Created invite {invite['id']} ({invite['remaining_uses']} use(s) remaining).")
+        if invite.get("label"):
+            print(f"label: {invite['label']}")
+        print(f"invite code: {invite['code']}")
+    return 0
+
+
+def cmd_invites(args: argparse.Namespace) -> int:
+    result = make_client(args).request("GET", "/invites")
+    if args.json:
+        emit(args, result)
+    else:
+        invites = result.get("invites", [])
+        if not invites:
+            print("No invites.")
+            return 0
+        for invite in invites:
+            expires = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(invite["expires_at"]))
+            status = "revoked" if invite["revoked_at"] else "active"
+            print(
+                f"{invite['id']} {status} uses={invite['uses']}/{invite['max_uses']} "
+                f"expires={expires} label={invite['label']}"
+            )
+    return 0
+
+
+def cmd_register(args: argparse.Namespace) -> int:
+    agent = clean_agent_name(args.agent or os.environ.get("AGENTMESSENGER_AGENT") or default_agent_name())
+    payload = {
+        "agent": agent,
+        "invite_code": args.invite_code,
+        "display_name": args.display_name or agent,
+    }
+    result = make_client(args).request("POST", "/register", payload)
+    if args.json:
+        emit(args, result)
+    else:
+        identity = result["identity"]
+        print(f"Registered {identity['agent']}.")
+        print("API key (shown once):")
+        print(identity["api_key"])
+        print("\nSet these in this agent session:")
+        print(f"export AGENTMESSENGER_AGENT={identity['agent']}")
+        print(f"export AGENTMESSENGER_API_KEY={identity['api_key']}")
+    return 0
+
+
+def cmd_whoami(args: argparse.Namespace) -> int:
+    result = make_client(args).request("GET", "/whoami")
+    if args.json:
+        emit(args, result)
+    else:
+        credential = result["credential"]
+        if credential["kind"] == "identity":
+            print(f"Authenticated as identity {credential['agent']}.")
+        else:
+            print(f"Authenticated as {credential['kind']}.")
     return 0
 
 
@@ -701,7 +1048,9 @@ def print_messages(messages: list[dict[str, Any]]) -> None:
 
 def add_client_options(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--url", default=os.environ.get("AGENTMESSENGER_URL", DEFAULT_URL))
-    parser.add_argument("--token", default=os.environ.get("AGENTMESSENGER_TOKEN"))
+    parser.add_argument("--token", default=os.environ.get("AGENTMESSENGER_TOKEN"), help="legacy/admin token")
+    parser.add_argument("--admin-token", default=os.environ.get("AGENTMESSENGER_ADMIN_TOKEN"))
+    parser.add_argument("--api-key", default=os.environ.get("AGENTMESSENGER_API_KEY"))
     parser.add_argument("--json", action="store_true", help="emit JSON")
 
 
@@ -718,7 +1067,8 @@ def build_parser() -> argparse.ArgumentParser:
     server = subparsers.add_parser("server", help="start broker")
     server.add_argument("--host", default="127.0.0.1")
     server.add_argument("--port", type=int, default=8765)
-    server.add_argument("--token", default=os.environ.get("AGENTMESSENGER_TOKEN"))
+    server.add_argument("--token", default=os.environ.get("AGENTMESSENGER_TOKEN"), help="deprecated alias for --admin-token")
+    server.add_argument("--admin-token", default=os.environ.get("AGENTMESSENGER_ADMIN_TOKEN"))
     server.add_argument("--db", default=os.environ.get("AGENTMESSENGER_DB"), help=f"SQLite DB path; default {DEFAULT_DB}")
     server.add_argument("--state", help="deprecated alias for --db")
     server.add_argument("--quiet", action="store_true")
@@ -727,6 +1077,28 @@ def build_parser() -> argparse.ArgumentParser:
     status = subparsers.add_parser("status", help="check broker health")
     add_client_options(status)
     status.set_defaults(func=cmd_status)
+
+    invite = subparsers.add_parser("invite", help="create an invite code with the admin token")
+    add_client_options(invite)
+    invite.add_argument("--label", default="")
+    invite.add_argument("--max-uses", type=int, default=1)
+    invite.add_argument("--ttl", type=int, default=DEFAULT_INVITE_TTL)
+    invite.set_defaults(func=cmd_invite)
+
+    invites = subparsers.add_parser("invites", help="list invites with the admin token")
+    add_client_options(invites)
+    invites.set_defaults(func=cmd_invites)
+
+    register = subparsers.add_parser("register", help="exchange an invite code for an agent API key")
+    add_client_options(register)
+    register.add_argument("--agent", default=os.environ.get("AGENTMESSENGER_AGENT"))
+    register.add_argument("--invite-code", required=True)
+    register.add_argument("--display-name")
+    register.set_defaults(func=cmd_register)
+
+    whoami = subparsers.add_parser("whoami", help="show the current credential")
+    add_client_options(whoami)
+    whoami.set_defaults(func=cmd_whoami)
 
     announce = subparsers.add_parser("announce", help="announce this agent's context")
     add_client_options(announce)
