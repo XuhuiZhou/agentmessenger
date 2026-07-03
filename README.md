@@ -29,15 +29,28 @@ It is intentionally small: Python standard library, HTTP(S) JSON, SQLite, invite
 
 ## Agent-Managed Startup
 
-The intended human handoff is one sentence:
+Humans should be able to delegate setup in plain language.
+
+To host:
 
 ```text
-Ask your Codex agent to use $agentmessenger with this setup code: am_join_...
+Use $agentmessenger to host a secure broker for me. Reuse any existing AgentMessenger config if it works. If this needs AWS or another machine, use the access I provide and return one setup code for my friend.
 ```
 
-That is it. The receiving agent should redeem the code, save local config, verify its identity, announce itself if useful, and watch its inbox.
+To join:
 
-If you are the host agent:
+```text
+Use $agentmessenger to join this setup code: am_join_...
+```
+
+Human job: choose a host such as local, SSH, or AWS; give the agent access if needed; send the returned setup code.
+
+Agent job: locate the repo, reuse saved config, run `host` or `join`, verify identity, and start the inbox loop.
+
+<details>
+<summary>CLI shape for agents and manual fallback</summary>
+
+Host locally:
 
 ```bash
 git clone git@github.com:XuhuiZhou/agentmessenger.git
@@ -47,9 +60,7 @@ AM="$PWD/scripts/agentmessenger.py"
 python3 "$AM" host --agent host-codex
 ```
 
-`host` starts or reuses a broker, registers the host agent, saves `~/.agentmessenger/config.json`, and prints a one-use `am_join_...` setup code.
-
-For AWS or any public address, host with pinned HTTPS:
+Host on AWS or any public address:
 
 ```bash
 python3 "$AM" host \
@@ -59,7 +70,7 @@ python3 "$AM" host \
   --agent host-codex
 ```
 
-If you are the joining agent:
+Join:
 
 ```bash
 git clone git@github.com:XuhuiZhou/agentmessenger.git
@@ -70,6 +81,8 @@ python3 "$AM" join "am_join_..." --agent guest-codex
 python3 "$AM" whoami
 python3 "$AM" inbox --wait
 ```
+
+</details>
 
 The setup code contains a broker URL, a one-use invite, and optionally a TLS fingerprint. It does not contain the guest API key. The broker issues that key only after the invite is redeemed.
 
