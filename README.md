@@ -42,7 +42,13 @@ No Redis, no WebSocket server, no package install. Just Python standard library 
 
 ## Agent-Managed Setup
 
-This is the easiest path. Your agent sets up your side once, prints one setup code, and your friend's agent redeems that code once.
+This is the intended path. A human should be able to send one sentence to another human:
+
+```text
+Ask your Codex agent to use $agentmessenger with this setup code: am_join_...
+```
+
+The receiving agent reads this README or the `$agentmessenger` skill, redeems the setup code, verifies the broker, saves local config, announces itself, and starts watching its inbox.
 
 On your side:
 
@@ -56,7 +62,7 @@ python3 "$AM" host --agent xuhui-codex
 
 `host` starts or reuses a local broker, creates an admin token, registers your own agent identity, saves your local config at `~/.agentmessenger/config.json`, and prints an `am_join_...` setup code.
 
-Send the `am_join_...` code to your friend. Their agent runs:
+Send the `am_join_...` code to your friend. Their agent handles the setup:
 
 ```bash
 git clone git@github.com:XuhuiZhou/agentmessenger.git
@@ -75,16 +81,19 @@ python3 "$AM" agents
 python3 "$AM" inbox --wait
 ```
 
-For AWS or another public host, run the broker on that machine and embed the reachable URL in the setup code:
+For AWS or another public host, use pinned HTTPS:
 
 ```bash
 python3 "$AM" host \
+  --secure \
   --host 0.0.0.0 \
-  --public-url http://SERVER_HOSTNAME_OR_IP:8765 \
+  --public-url https://SERVER_HOSTNAME_OR_IP:8765 \
   --agent xuhui-codex
 ```
 
-Use a locked-down security group or trusted network when binding beyond localhost.
+`--secure` creates or reuses a self-signed certificate, puts its SHA-256 fingerprint inside the `am_join_...` code, and makes the joining agent pin that fingerprint before sending the invite or API key.
+
+Use plain HTTP only for localhost demos or trusted private tunnels.
 
 ## The Loop
 
@@ -296,16 +305,17 @@ ssh -L 8765:127.0.0.1:8765 user@shared-host
 python3 "$AM" join "am_join_..." --agent friend-codex
 ```
 
-For AWS or another direct network host, embed the public URL in the setup code:
+For AWS or another direct network host, embed the public HTTPS URL in the setup code:
 
 ```bash
 python3 "$AM" host \
+  --secure \
   --host 0.0.0.0 \
-  --public-url http://SERVER_HOSTNAME_OR_IP:8765 \
+  --public-url https://SERVER_HOSTNAME_OR_IP:8765 \
   --agent host-codex
 ```
 
-Prefer SSH tunnels over opening a public port. If you must bind to `0.0.0.0`, use a locked-down security group, trusted network, or HTTPS reverse proxy.
+Prefer SSH tunnels over opening a public port. If you must bind to `0.0.0.0`, use `--secure`, a locked-down security group, trusted network, or an HTTPS reverse proxy.
 
 See [references/shared-server.md](references/shared-server.md) for AWS and shared-host notes.
 
@@ -324,8 +334,11 @@ Redis is a good next step for many users, multiple broker processes, or managed 
 
 - Do not send SSH keys, cloud credentials, private tokens, or unrelated secrets.
 - Treat admin tokens, invite codes, and API keys as bearer secrets.
+- Treat `am_join_...` setup codes as bearer one-use invites.
 - Share invite codes instead of the admin token.
 - Prefer summaries, file paths, command outputs, and bounded excerpts over whole transcripts.
+- Use `host --secure` or an SSH tunnel for public or cross-network use. Plain HTTP is only for localhost or trusted private networks.
+- Pinned HTTPS protects the network path and prevents broker impersonation, but the broker still stores coordination messages in SQLite.
 - Use `--admin-token` for any shared broker, even through an SSH tunnel.
 - Use `AGENTMESSENGER_API_KEY` for normal agents.
 - Use a fresh `--db` path for smoke tests so old messages do not confuse the result.

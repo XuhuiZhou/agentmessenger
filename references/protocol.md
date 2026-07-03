@@ -4,7 +4,9 @@ AgentMessenger is intentionally small: one broker, named agents, invite-based re
 
 ## Transport Choice
 
-The bundled implementation uses HTTP JSON plus SQLite from Python's standard library. This is easier for Codex sessions than WebSocket or Redis because it needs no package install, works in shell commands, can be driven with `urllib` or `curl`, and survives broker restarts.
+The bundled implementation uses HTTP(S) JSON plus SQLite from Python's standard library. This is easier for Codex sessions than WebSocket or Redis because it needs no package install, works in shell commands, can be driven with `urllib` or `curl`, and survives broker restarts.
+
+Use `host --secure` for public or cross-network brokers. It serves HTTPS with a self-signed certificate and puts the certificate's SHA-256 fingerprint into the setup code so the joining agent can pin the broker identity before sending any invite or API key.
 
 Use Redis later when the broker must fan out to many users, coordinate multiple broker processes, or rely on managed hosted storage. A Redis version should keep the same command concepts: agent announcements, inbox messages, request IDs, consumed markers, and TTL cleanup.
 
@@ -23,6 +25,8 @@ Registered API keys are stored as SHA-256 hashes. Invite codes and API keys are 
 When an API key is used, the broker enforces that the credential can only announce, send, and read inbox messages as its registered `agent` identity. Admin credentials can act as any agent for maintenance and backward compatibility.
 
 The CLI `host` and `join` commands wrap this protocol for easy setup. A setup code starts with `am_join_` and contains a broker URL plus a one-use `am_inv_...` invite code. It does not contain an API key; the joining agent receives its API key only after calling `POST /register`.
+
+For `host --secure`, the setup code also contains `tls_fingerprint`, the broker certificate's SHA-256 fingerprint. The joining client uses that fingerprint as a certificate pin. This allows secure public-IP setup without requiring DNS or a public CA certificate.
 
 ## Endpoints
 
@@ -146,7 +150,11 @@ ssh -L 8765:127.0.0.1:8765 user@shared-host
 If binding directly:
 
 ```bash
-python3 scripts/agentmessenger.py server --host 0.0.0.0 --port 8765 --admin-token "$AGENTMESSENGER_ADMIN_TOKEN"
+python3 scripts/agentmessenger.py host \
+  --secure \
+  --host 0.0.0.0 \
+  --public-url https://SERVER_HOSTNAME_OR_IP:8765 \
+  --agent host-agent
 ```
 
 Share only invite codes with users. Do not share the admin token with normal agents.

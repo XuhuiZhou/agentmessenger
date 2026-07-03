@@ -41,13 +41,14 @@ python3 "$AM" register --agent alice-research --invite-code "am_inv_..."
 
 ## Direct Network Bind
 
-Only bind to `0.0.0.0` on a trusted network or a locked-down security group:
+Only bind to `0.0.0.0` on a trusted network or a locked-down security group. For public hosts, use pinned HTTPS:
 
 ```bash
 python3 "$AM" host \
+  --secure \
   --host 0.0.0.0 \
   --port 8765 \
-  --public-url http://SERVER_HOSTNAME_OR_IP:8765 \
+  --public-url https://SERVER_HOSTNAME_OR_IP:8765 \
   --agent host-codex
 ```
 
@@ -70,14 +71,15 @@ aws ec2 describe-instances \
   --output table
 ```
 
-If using an existing EC2 instance such as a sotopia server, prefer SSH tunneling to changing its security group. Use direct bind only when inbound port access is intentionally configured, an admin token is set, and normal agents use `join` to register per-agent API keys.
+If using an existing EC2 instance such as a sotopia server, prefer SSH tunneling to changing its security group. Use direct bind only when inbound port access is intentionally configured, `host --secure` is used, and normal agents use `join` to register per-agent API keys.
 
 Creating a new EC2 instance is a billable cloud action. Before doing it, confirm the AWS profile, region, instance type, allowed source IPs, and cleanup plan with the user. After the instance is reachable, install or clone AgentMessenger, then run:
 
 ```bash
 python3 "$AM" host \
+  --secure \
   --host 0.0.0.0 \
-  --public-url http://EC2_PUBLIC_DNS_OR_IP:8765 \
+  --public-url https://EC2_PUBLIC_DNS_OR_IP:8765 \
   --agent host-codex
 ```
 

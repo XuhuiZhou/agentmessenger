@@ -7,11 +7,19 @@ description: Start and use a lightweight local or shared broker for Codex-to-Cod
 
 Use this skill when agents need to exchange context without copying large chat logs by hand. Prefer short summaries and targeted requests; send raw files or sensitive state only when the user clearly wants that.
 
+When the user provides an `am_join_...` setup code, treat it as an instruction to connect this agent. Do the setup yourself: run `join`, verify with `whoami`, announce the current context if useful, then offer to watch `inbox --wait`. Do not ask the user to export environment variables unless the automatic config path fails.
+
 ## Quick Start
 
 The bundled broker is a zero-dependency Python HTTP server backed by SQLite. In shell examples, first point `AM` at the installed skill script.
 
-Prefer the one-code setup flow when helping users connect multiple agents. The host side runs:
+Prefer the one-code setup flow when helping users connect multiple agents. The human handoff should be:
+
+```text
+Ask your Codex agent to use $agentmessenger with this setup code: am_join_...
+```
+
+The host side runs:
 
 ```bash
 AM="${CODEX_HOME:-$HOME/.codex}/skills/agentmessenger/scripts/agentmessenger.py"
@@ -19,6 +27,18 @@ python3 "$AM" host --agent "$(whoami)-$(basename "$PWD")"
 ```
 
 This starts or reuses a broker, registers the host agent, saves `~/.agentmessenger/config.json`, and prints an `am_join_...` setup code. Send only that setup code to the other user or agent.
+
+For public hosts or AWS, use pinned HTTPS:
+
+```bash
+python3 "$AM" host \
+  --secure \
+  --host 0.0.0.0 \
+  --public-url https://SERVER_HOSTNAME_OR_IP:8765 \
+  --agent "$(whoami)-$(basename "$PWD")"
+```
+
+`--secure` creates or reuses a self-signed certificate, embeds its SHA-256 fingerprint in the setup code, and makes the joining agent verify that fingerprint before sending the invite or API key.
 
 The joining side runs:
 
@@ -94,8 +114,9 @@ python3 "$AM" reply \
 
 - Do not send API keys, SSH keys, tokens, private credentials, or secrets.
 - Prefer summaries, file paths, command outputs, and bounded excerpts over whole transcripts.
-- If binding beyond localhost, require `--admin-token`, issue per-agent API keys through invites, use a trusted network or SSH tunnel, and avoid `0.0.0.0` unless the user explicitly needs remote access.
+- If binding beyond localhost, prefer `host --secure` or an SSH tunnel. Avoid public plain HTTP for real conversations.
 - Treat `am_join_...` setup codes as bearer invites. They include a broker URL and a one-use invite code, but not an API key.
+- Pinned HTTPS protects the network path and prevents broker impersonation. The broker operator can still inspect SQLite state, so do not treat it as end-to-end encrypted storage.
 - For shared smoke tests, use a fresh `--db` path and `--admin-token` so old messages or other clients cannot confuse the result.
 - Treat broker state as coordination state. SQLite persistence helps recover from restarts, but it is not a secure long-term archive.
 

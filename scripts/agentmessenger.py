@@ -13,6 +13,7 @@ import re
 import signal
 import socket
 import sqlite3
+import ssl
 import subprocess
 import sys
 import threading
@@ -31,11 +32,13 @@ DEFAULT_URL = "http://127.0.0.1:8765"
 DEFAULT_DB = "~/.agentmessenger/broker.sqlite3"
 DEFAULT_CONFIG = "~/.agentmessenger/config.json"
 DEFAULT_LOG = "~/.agentmessenger/server.log"
+DEFAULT_TLS_CERT = "~/.agentmessenger/server.crt"
+DEFAULT_TLS_KEY = "~/.agentmessenger/server.key"
 DEFAULT_TTL = 3600
 DEFAULT_INVITE_TTL = 7 * 24 * 3600
 MAX_WAIT_SECONDS = 120
 JOIN_CODE_PREFIX = "am_join_"
-VERSION = "0.4.0"
+VERSION = "0.5.0"
 
 
 class BrokerError(Exception):
@@ -105,6 +108,69 @@ def save_config(config: dict[str, Any], path: str | Path | None = None) -> Path:
     except OSError:
         pass
     return config_path
+
+
+def normalize_fingerprint(value: str | None) -> str | None:
+    if not value:
+        return None
+    cleaned = re.sub(r"[^A-Fa-f0-9]", "", value)
+    if not cleaned:
+        return None
+    if len(cleaned) != 64:
+        raise SystemExit("TLS fingerprint must be a SHA-256 hex digest")
+    return cleaned.lower()
+
+
+def pem_cert_fingerprint(cert_path: str | Path) -> str:
+    pem = Path(cert_path).expanduser().read_text(encoding="utf-8")
+    der = ssl.PEM_cert_to_DER_cert(pem)
+    return hashlib.sha256(der).hexdigest()
+
+
+def generate_self_signed_cert(cert_path: str | Path, key_path: str | Path, common_name: str, days: int) -> None:
+    cert = Path(cert_path).expanduser()
+    key = Path(key_path).expanduser()
+    cert.parent.mkdir(parents=True, exist_ok=True)
+    key.parent.mkdir(parents=True, exist_ok=True)
+    subject = f"/CN={common_name or 'agentmessenger'}"
+    command = [
+        "openssl",
+        "req",
+        "-x509",
+        "-newkey",
+        "rsa:2048",
+        "-nodes",
+        "-keyout",
+        str(key),
+        "-out",
+        str(cert),
+        "-days",
+        str(days),
+        "-subj",
+        subject,
+    ]
+    try:
+        subprocess.run(command, check=True, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE, text=True)
+    except FileNotFoundError as exc:
+        raise SystemExit("openssl is required for --secure certificate generation") from exc
+    except subprocess.CalledProcessError as exc:
+        raise SystemExit(f"openssl failed to generate a TLS certificate: {exc.stderr.strip()}") from exc
+    try:
+        os.chmod(key, 0o600)
+        os.chmod(cert, 0o644)
+    except OSError:
+        pass
+
+
+def ensure_tls_material(args: argparse.Namespace, config: dict[str, Any]) -> tuple[str, str, str]:
+    cert_path = str(Path(args.tls_cert or str(config.get("tls_cert") or DEFAULT_TLS_CERT)).expanduser())
+    key_path = str(Path(args.tls_key or str(config.get("tls_key") or DEFAULT_TLS_KEY)).expanduser())
+    if not Path(cert_path).exists() or not Path(key_path).exists():
+        public_url = args.public_url or args.url or ""
+        parsed = urllib.parse.urlparse(public_url)
+        common_name = parsed.hostname or socket.gethostname()
+        generate_self_signed_cert(cert_path, key_path, common_name, args.tls_days)
+    return cert_path, key_path, pem_cert_fingerprint(cert_path)
 
 
 def redact_config(config: dict[str, Any]) -> dict[str, Any]:
@@ -827,9 +893,18 @@ def run_server(args: argparse.Namespace) -> int:
     signal.signal(signal.SIGTERM, stop)
     host, port = server.server_address[:2]
     display_host = args.host if args.host != "0.0.0.0" else host
-    url = f"http://{display_host}:{port}"
+    scheme = "https" if args.tls_cert or args.tls_key else "http"
+    if args.tls_cert or args.tls_key:
+        if not args.tls_cert or not args.tls_key:
+            raise SystemExit("--tls-cert and --tls-key must be passed together")
+        context = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
+        context.load_cert_chain(str(Path(args.tls_cert).expanduser()), str(Path(args.tls_key).expanduser()))
+        server.socket = context.wrap_socket(server.socket, server_side=True)
+    url = f"{scheme}://{display_host}:{port}"
     print(f"AgentMessenger broker listening at {url}", flush=True)
     print(f"SQLite database: {broker.db_path}", flush=True)
+    if scheme == "https":
+        print(f"TLS fingerprint: {pem_cert_fingerprint(args.tls_cert)}", flush=True)
     if server.admin_token:  # type: ignore[attr-defined]
         print("Admin token is enabled. Use it to create invites; agents should register API keys.", flush=True)
     elif args.host not in {"127.0.0.1", "localhost", "::1"}:
@@ -850,11 +925,13 @@ class Client:
         url: str,
         token: str | None = None,
         api_key: str | None = None,
+        tls_fingerprint: str | None = None,
         timeout: float = MAX_WAIT_SECONDS + 10,
     ) -> None:
         self.url = url.rstrip("/")
         self.token = token
         self.api_key = api_key
+        self.tls_fingerprint = normalize_fingerprint(tls_fingerprint)
         self.timeout = timeout
 
     def request(self, method: str, path: str, body: dict[str, Any] | None = None) -> dict[str, Any]:
@@ -869,13 +946,29 @@ class Client:
             headers["X-AgentMessenger-Api-Key"] = self.api_key
         request = urllib.request.Request(f"{self.url}{path}", data=data, headers=headers, method=method)
         try:
-            with urllib.request.urlopen(request, timeout=self.timeout) as response:
+            context = None
+            if urllib.parse.urlparse(self.url).scheme == "https" and self.tls_fingerprint:
+                context = ssl._create_unverified_context()
+            with urllib.request.urlopen(request, timeout=self.timeout, context=context) as response:
+                if self.tls_fingerprint:
+                    self.verify_tls_fingerprint(response)
                 return json.loads(response.read().decode("utf-8"))
         except urllib.error.HTTPError as exc:
             detail = exc.read().decode("utf-8")
             raise SystemExit(f"{method} {path} failed: HTTP {exc.code} {detail}") from exc
         except urllib.error.URLError as exc:
             raise SystemExit(f"Could not reach AgentMessenger broker at {self.url}: {exc.reason}") from exc
+
+    def verify_tls_fingerprint(self, response: Any) -> None:
+        sock = getattr(getattr(response, "fp", None), "raw", None)
+        sock = getattr(sock, "_sock", None)
+        if sock is None:
+            raise SystemExit("Could not inspect TLS certificate for fingerprint pinning")
+        actual = hashlib.sha256(sock.getpeercert(binary_form=True)).hexdigest()
+        if not hmac.compare_digest(actual, self.tls_fingerprint or ""):
+            raise SystemExit(
+                "TLS fingerprint mismatch. The broker certificate does not match the setup code."
+            )
 
 
 def make_client(
@@ -892,10 +985,17 @@ def make_client(
     api_key = getattr(args, "api_key", None) or os.environ.get("AGENTMESSENGER_API_KEY")
     if not api_key:
         api_key = str(config.get("api_key") or "") or None
+    tls_fingerprint = (
+        getattr(args, "tls_fingerprint", None)
+        or os.environ.get("AGENTMESSENGER_TLS_FINGERPRINT")
+        or str(config.get("tls_fingerprint") or "")
+        or None
+    )
     return Client(
         getattr(args, "url", None) or os.environ.get("AGENTMESSENGER_URL") or str(config.get("url") or DEFAULT_URL),
         token=token,
         api_key=api_key,
+        tls_fingerprint=tls_fingerprint,
         timeout=timeout,
     )
 
@@ -964,12 +1064,17 @@ def cmd_register(args: argparse.Namespace) -> int:
     return 0
 
 
-def wait_for_broker(url: str, admin_token: str | None = None, timeout: float = 10) -> None:
+def wait_for_broker(
+    url: str,
+    admin_token: str | None = None,
+    timeout: float = 10,
+    tls_fingerprint: str | None = None,
+) -> None:
     deadline = time.time() + timeout
     last_error: Exception | None = None
     while time.time() < deadline:
         try:
-            Client(url, token=admin_token, timeout=1).request("GET", "/health")
+            Client(url, token=admin_token, tls_fingerprint=tls_fingerprint, timeout=1).request("GET", "/health")
             return
         except SystemExit as exc:
             last_error = exc
@@ -979,9 +1084,9 @@ def wait_for_broker(url: str, admin_token: str | None = None, timeout: float = 1
     raise SystemExit(f"Could not reach AgentMessenger broker at {url}")
 
 
-def broker_is_reachable(url: str, admin_token: str | None = None) -> bool:
+def broker_is_reachable(url: str, admin_token: str | None = None, tls_fingerprint: str | None = None) -> bool:
     try:
-        Client(url, token=admin_token, timeout=1).request("GET", "/health")
+        Client(url, token=admin_token, tls_fingerprint=tls_fingerprint, timeout=1).request("GET", "/health")
         return True
     except SystemExit:
         return False
@@ -993,6 +1098,8 @@ def start_background_server(
     db_path: str,
     admin_token: str,
     log_path: str,
+    tls_cert: str | None = None,
+    tls_key: str | None = None,
     quiet: bool = True,
 ) -> int:
     resolved_log = Path(log_path).expanduser()
@@ -1010,6 +1117,10 @@ def start_background_server(
         "--admin-token",
         admin_token,
     ]
+    if tls_cert or tls_key:
+        if not tls_cert or not tls_key:
+            raise SystemExit("tls_cert and tls_key must be passed together")
+        command.extend(["--tls-cert", tls_cert, "--tls-key", tls_key])
     if quiet:
         command.append("--quiet")
     log_file = resolved_log.open("a", encoding="utf-8")
@@ -1040,7 +1151,21 @@ def create_invite(client: Client, label: str, max_uses: int, ttl: int) -> dict[s
 def cmd_host(args: argparse.Namespace) -> int:
     config_path = resolve_config_path(args.config)
     config = load_config(config_path)
-    local_url = args.url or os.environ.get("AGENTMESSENGER_URL") or str(config.get("url") or f"http://127.0.0.1:{args.port}")
+    secure = args.secure or str(args.public_url or args.url or config.get("url") or "").startswith("https://")
+    tls_cert: str | None = None
+    tls_key: str | None = None
+    tls_fingerprint = normalize_fingerprint(args.tls_fingerprint or str(config.get("tls_fingerprint") or ""))
+    if secure:
+        tls_cert, tls_key, tls_fingerprint = ensure_tls_material(args, config)
+    scheme = "https" if secure else "http"
+    explicit_url = args.url or os.environ.get("AGENTMESSENGER_URL")
+    saved_url = str(config.get("url") or "")
+    if explicit_url:
+        local_url = explicit_url
+    elif saved_url and (not secure or saved_url.startswith("https://")):
+        local_url = saved_url
+    else:
+        local_url = f"{scheme}://127.0.0.1:{args.port}"
     public_url = args.public_url or local_url
     admin_token = (
         args.admin_token
@@ -1053,20 +1178,33 @@ def cmd_host(args: argparse.Namespace) -> int:
     server_pid: int | None = None
 
     if args.no_start:
-        wait_for_broker(local_url, admin_token=admin_token, timeout=args.timeout)
-    elif broker_is_reachable(local_url, admin_token=admin_token):
+        wait_for_broker(local_url, admin_token=admin_token, timeout=args.timeout, tls_fingerprint=tls_fingerprint)
+    elif broker_is_reachable(local_url, admin_token=admin_token, tls_fingerprint=tls_fingerprint):
         server_pid = int(config["server_pid"]) if str(config.get("server_pid") or "").isdigit() else None
     else:
-        server_pid = start_background_server(args.host, args.port, db_path, admin_token, log_path)
-        wait_for_broker(local_url, admin_token=admin_token, timeout=args.timeout)
+        server_pid = start_background_server(
+            args.host,
+            args.port,
+            db_path,
+            admin_token,
+            log_path,
+            tls_cert=tls_cert,
+            tls_key=tls_key,
+        )
+        wait_for_broker(local_url, admin_token=admin_token, timeout=args.timeout, tls_fingerprint=tls_fingerprint)
 
-    admin_client = Client(local_url, token=admin_token)
+    admin_client = Client(local_url, token=admin_token, tls_fingerprint=tls_fingerprint)
     agent = clean_agent_name(args.agent or str(config.get("agent") or "") or default_agent_name())
     api_key = str(config.get("api_key") or "") if config.get("agent") == agent else ""
     try:
         if not api_key:
             self_invite = create_invite(admin_client, f"host:{agent}", 1, args.ttl)
-            identity = register_with_invite(Client(local_url), agent, self_invite["code"], args.display_name or agent)
+            identity = register_with_invite(
+                Client(local_url, tls_fingerprint=tls_fingerprint),
+                agent,
+                self_invite["code"],
+                args.display_name or agent,
+            )
             api_key = identity["api_key"]
 
         invite_label = args.label or f"join:{agent}"
@@ -1086,6 +1224,8 @@ def cmd_host(args: argparse.Namespace) -> int:
     }
     if args.note:
         join_payload["note"] = args.note
+    if tls_fingerprint:
+        join_payload["tls_fingerprint"] = tls_fingerprint
     join_code = encode_join_code(join_payload)
 
     saved = {
@@ -1098,6 +1238,11 @@ def cmd_host(args: argparse.Namespace) -> int:
         "server_log": log_path,
         "updated_at": now(),
     }
+    if tls_fingerprint:
+        saved["tls_fingerprint"] = tls_fingerprint
+    if tls_cert and tls_key:
+        saved["tls_cert"] = tls_cert
+        saved["tls_key"] = tls_key
     if server_pid:
         saved["server_pid"] = server_pid
     save_config(saved, config_path)
@@ -1111,6 +1256,7 @@ def cmd_host(args: argparse.Namespace) -> int:
         "invite": invite,
         "server_pid": server_pid,
         "server_log": log_path,
+        "tls_fingerprint": tls_fingerprint,
     }
     if args.json:
         emit(args, result)
@@ -1118,6 +1264,10 @@ def cmd_host(args: argparse.Namespace) -> int:
         print(f"AgentMessenger host is ready for {agent}.")
         print(f"config: {config_path}")
         print(f"broker url: {local_url}")
+        if tls_fingerprint:
+            print(f"tls fingerprint: {tls_fingerprint}")
+        elif urllib.parse.urlparse(public_url).scheme == "http" and args.host not in {"127.0.0.1", "localhost", "::1"}:
+            print("warning: public HTTP is not encrypted; prefer --secure for real conversations")
         if server_pid:
             print(f"server pid: {server_pid}")
         print("\nSend this setup code to your friend:")
@@ -1138,8 +1288,18 @@ def cmd_join(args: argparse.Namespace) -> int:
     invite_code = str(payload.get("invite_code") or "")
     if not invite_code:
         raise SystemExit("Join code does not include an invite code")
+    tls_fingerprint = normalize_fingerprint(
+        args.tls_fingerprint
+        or str(payload.get("tls_fingerprint") or "")
+        or str(config.get("tls_fingerprint") or "")
+    )
     agent = configured_agent(args)
-    identity = register_with_invite(Client(url), agent, invite_code, args.display_name or agent)
+    identity = register_with_invite(
+        Client(url, tls_fingerprint=tls_fingerprint),
+        agent,
+        invite_code,
+        args.display_name or agent,
+    )
     saved = {
         **config,
         "url": url,
@@ -1148,6 +1308,8 @@ def cmd_join(args: argparse.Namespace) -> int:
         "joined_at": now(),
         "setup_label": payload.get("label", ""),
     }
+    if tls_fingerprint:
+        saved["tls_fingerprint"] = tls_fingerprint
     if previous_url and previous_url != url:
         for key in ("admin_token", "db", "server_log", "server_pid"):
             saved.pop(key, None)
@@ -1157,6 +1319,7 @@ def cmd_join(args: argparse.Namespace) -> int:
         "config_path": str(config_path),
         "url": url,
         "credential": "saved",
+        "tls_fingerprint": tls_fingerprint,
     }
     if args.json:
         emit(args, result)
@@ -1164,6 +1327,8 @@ def cmd_join(args: argparse.Namespace) -> int:
         print(f"Joined AgentMessenger as {identity['agent']}.")
         print(f"config: {config_path}")
         print("Saved broker URL and API key. Future commands can use the saved config automatically.")
+        if tls_fingerprint:
+            print("Pinned the broker TLS fingerprint from the setup code.")
         print("\nTry:")
         print(f"python3 {Path(__file__).resolve()} whoami")
         print(f"python3 {Path(__file__).resolve()} agents")
@@ -1368,6 +1533,7 @@ def add_client_options(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--admin-token")
     parser.add_argument("--api-key")
     parser.add_argument("--config", help=f"config path; default {DEFAULT_CONFIG}")
+    parser.add_argument("--tls-fingerprint", help="expected broker TLS certificate SHA-256 fingerprint")
     parser.add_argument("--json", action="store_true", help="emit JSON")
 
 
@@ -1388,6 +1554,8 @@ def build_parser() -> argparse.ArgumentParser:
     server.add_argument("--admin-token", default=os.environ.get("AGENTMESSENGER_ADMIN_TOKEN"))
     server.add_argument("--db", default=os.environ.get("AGENTMESSENGER_DB"), help=f"SQLite DB path; default {DEFAULT_DB}")
     server.add_argument("--state", help="deprecated alias for --db")
+    server.add_argument("--tls-cert", help="TLS certificate path for HTTPS")
+    server.add_argument("--tls-key", help="TLS private key path for HTTPS")
     server.add_argument("--quiet", action="store_true")
     server.set_defaults(func=run_server)
 
@@ -1402,6 +1570,10 @@ def build_parser() -> argparse.ArgumentParser:
     host.add_argument("--public-url", help="URL embedded in the setup code; use for AWS or public hosts")
     host.add_argument("--db", help=f"SQLite DB path; default {DEFAULT_DB}")
     host.add_argument("--log", help=f"server log path; default {DEFAULT_LOG}")
+    host.add_argument("--secure", action="store_true", help="serve HTTPS with a pinned self-signed certificate")
+    host.add_argument("--tls-cert", help=f"TLS certificate path; default {DEFAULT_TLS_CERT}")
+    host.add_argument("--tls-key", help=f"TLS private key path; default {DEFAULT_TLS_KEY}")
+    host.add_argument("--tls-days", type=int, default=365)
     host.add_argument("--agent")
     host.add_argument("--display-name")
     host.add_argument("--label", default="", help="label for the friend invite")

@@ -4,8 +4,12 @@
 from __future__ import annotations
 
 import json
+import os
 import re
 import secrets
+import shutil
+import signal
+import socket
 import subprocess
 import sys
 import tempfile
@@ -46,6 +50,43 @@ def json_cli(
 ) -> dict:
     result = run_cli(url, *args, admin_token=admin_token, api_key=api_key)
     return json.loads(result.stdout)
+
+
+def run_raw(*args: str) -> subprocess.CompletedProcess[str]:
+    return subprocess.run(
+        [sys.executable, str(CLI), *args],
+        cwd=ROOT,
+        check=True,
+        text=True,
+        capture_output=True,
+    )
+
+
+def free_tcp_port() -> int:
+    sock = socket.socket()
+    try:
+        sock.bind(("127.0.0.1", 0))
+        return int(sock.getsockname()[1])
+    finally:
+        sock.close()
+
+
+def stop_pid(pid: int) -> None:
+    try:
+        os.kill(pid, signal.SIGTERM)
+    except ProcessLookupError:
+        return
+    deadline = time.time() + 5
+    while time.time() < deadline:
+        try:
+            os.kill(pid, 0)
+        except ProcessLookupError:
+            return
+        time.sleep(0.1)
+    try:
+        os.kill(pid, signal.SIGKILL)
+    except ProcessLookupError:
+        pass
 
 
 def wait_for_server(proc: subprocess.Popen[str]) -> str:
@@ -189,6 +230,53 @@ def main() -> int:
             assert "friend" in {agent["name"] for agent in agents}
         finally:
             stop_server(proc)
+
+        if shutil.which("openssl"):
+            secure_port = free_tcp_port()
+            secure_host_config = Path(temp_dir) / "secure-host-config.json"
+            secure_friend_config = Path(temp_dir) / "secure-friend-config.json"
+            secure_host = json.loads(
+                run_raw(
+                    "host",
+                    "--secure",
+                    "--port",
+                    str(secure_port),
+                    "--config",
+                    str(secure_host_config),
+                    "--db",
+                    str(Path(temp_dir) / "secure.sqlite3"),
+                    "--log",
+                    str(Path(temp_dir) / "secure.log"),
+                    "--tls-cert",
+                    str(Path(temp_dir) / "secure.crt"),
+                    "--tls-key",
+                    str(Path(temp_dir) / "secure.key"),
+                    "--agent",
+                    "secure-owner",
+                    "--json",
+                ).stdout
+            )
+            secure_pid = int(secure_host["server_pid"])
+            try:
+                assert secure_host["url"].startswith("https://")
+                assert len(secure_host["tls_fingerprint"]) == 64
+                secure_join = json.loads(
+                    run_raw(
+                        "join",
+                        secure_host["join_code"],
+                        "--agent",
+                        "secure-friend",
+                        "--config",
+                        str(secure_friend_config),
+                        "--json",
+                    ).stdout
+                )
+                assert secure_join["agent"] == "secure-friend"
+                assert secure_join["tls_fingerprint"] == secure_host["tls_fingerprint"]
+                secure_whoami = json.loads(run_raw("whoami", "--config", str(secure_friend_config), "--json").stdout)
+                assert secure_whoami["credential"]["agent"] == "secure-friend"
+            finally:
+                stop_pid(secure_pid)
 
         db_path = Path(temp_dir) / "broker.sqlite3"
         proc, url = start_server(db_path, admin_token)
