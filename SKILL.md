@@ -9,10 +9,11 @@ Use this skill when agents need to exchange context without copying large chat l
 
 ## Quick Start
 
-The bundled broker is a zero-dependency Python HTTP server. It is easiest to run one broker per machine or shared SSH host:
+The bundled broker is a zero-dependency Python HTTP server backed by SQLite. In shell examples, first point `AM` at the installed skill script:
 
 ```bash
-python3 scripts/agentmessenger.py server --host 127.0.0.1 --port 8765
+AM="${CODEX_HOME:-$HOME/.codex}/skills/agentmessenger/scripts/agentmessenger.py"
+python3 "$AM" server --host 127.0.0.1 --port 8765 --db ~/.agentmessenger/broker.sqlite3
 ```
 
 Set these in every participating Codex session:
@@ -25,7 +26,7 @@ export AGENTMESSENGER_AGENT="$(whoami)-$(basename "$PWD")"
 Announce the local agent's current context:
 
 ```bash
-python3 scripts/agentmessenger.py announce \
+python3 "$AM" announce \
   --summary "Working on the API bug in repo X; can share current findings." \
   --context-file /tmp/codex-context.md
 ```
@@ -33,13 +34,13 @@ python3 scripts/agentmessenger.py announce \
 Find peers:
 
 ```bash
-python3 scripts/agentmessenger.py agents
+python3 "$AM" agents
 ```
 
 Ask another agent for context and wait for a reply:
 
 ```bash
-python3 scripts/agentmessenger.py ask \
+python3 "$AM" ask \
   --to other-agent \
   --question "What have you learned about the failing test?" \
   --wait
@@ -48,13 +49,13 @@ python3 scripts/agentmessenger.py ask \
 Watch the local inbox in the other Codex session:
 
 ```bash
-python3 scripts/agentmessenger.py inbox --wait
+python3 "$AM" inbox --wait
 ```
 
 Reply to a request:
 
 ```bash
-python3 scripts/agentmessenger.py reply \
+python3 "$AM" reply \
   --to requesting-agent \
   --request-id m000001 \
   --message "The failure starts after the cache key change." \
@@ -75,13 +76,14 @@ python3 scripts/agentmessenger.py reply \
 - Do not send API keys, SSH keys, tokens, private credentials, or secrets.
 - Prefer summaries, file paths, command outputs, and bounded excerpts over whole transcripts.
 - If binding beyond localhost, require `--token`, use a trusted network or SSH tunnel, and avoid `0.0.0.0` unless the user explicitly needs remote access.
-- Treat broker state as ephemeral coordination state, not durable storage.
+- For shared smoke tests, use a fresh `--db` path and `--token` so old messages or other clients cannot confuse the result.
+- Treat broker state as coordination state. SQLite persistence helps recover from restarts, but it is not a secure long-term archive.
 
 ## Scripts
 
 Use `scripts/agentmessenger.py` for all operations. It supports:
 
-- `server`: start the broker.
+- `server`: start the SQLite-backed broker.
 - `status`: check broker health.
 - `announce`: publish this session's summary and optional context.
 - `agents`: list active agents.
@@ -91,4 +93,6 @@ Use `scripts/agentmessenger.py` for all operations. It supports:
 - `reply`: respond to a request.
 - `note`: send a one-way note.
 
-Read `references/protocol.md` when changing the broker, debugging endpoint behavior, exposing it across machines, or deciding whether Redis/WebSocket support is needed.
+Run `scripts/self_test_agentmessenger.py` after changing the broker or CLI.
+
+Read `references/protocol.md` when changing endpoint behavior or deciding whether Redis/WebSocket support is needed. Read `references/shared-server.md` when exposing a broker through SSH, AWS, or another shared machine.

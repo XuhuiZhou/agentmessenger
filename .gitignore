@@ -2,3 +2,7 @@ __pycache__/
 *.py[cod]
 .DS_Store
 .agentmessenger/
+*.sqlite
+*.sqlite3
+*.sqlite3-*
+*.db

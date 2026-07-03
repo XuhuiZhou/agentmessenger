@@ -1,12 +1,12 @@
 # AgentMessenger Protocol
 
-AgentMessenger is intentionally small: one broker, named agents, TTL-based announcements, and message inboxes.
+AgentMessenger is intentionally small: one broker, named agents, TTL-based announcements, SQLite persistence, and message inboxes.
 
 ## Transport Choice
 
-The bundled implementation uses HTTP JSON over Python's standard library. This is easier for Codex sessions than WebSocket or Redis because it needs no package install, works in shell commands, and can be driven with `urllib` or `curl`.
+The bundled implementation uses HTTP JSON plus SQLite from Python's standard library. This is easier for Codex sessions than WebSocket or Redis because it needs no package install, works in shell commands, can be driven with `urllib` or `curl`, and survives broker restarts.
 
-Use Redis later when the broker must survive process restarts, fan out to many users, or coordinate across hosts without SSH tunneling. A Redis version should keep the same command concepts: agent announcements, inbox messages, request IDs, and TTL cleanup.
+Use Redis later when the broker must fan out to many users, coordinate multiple broker processes, or rely on managed hosted storage. A Redis version should keep the same command concepts: agent announcements, inbox messages, request IDs, consumed markers, and TTL cleanup.
 
 Use WebSocket later when agents need streaming token-by-token updates or a UI with live presence. For Codex shell workflows, long polling through `inbox --wait` is usually enough.
 
@@ -75,6 +75,18 @@ Read messages addressed to `agent` or `*`. `wait` enables long polling. When `co
 }
 ```
 
+## SQLite Storage
+
+The server defaults to `~/.agentmessenger/broker.sqlite3`, or `AGENTMESSENGER_DB` when set. Use `--db :memory:` only for isolated tests.
+
+Tables:
+
+- `agents`: one active row per announced agent.
+- `messages`: all unexpired messages, ordered by `seq`.
+- `message_consumed`: per-agent consumption markers, so broadcast messages can be consumed independently by each recipient.
+
+Expired agents and messages are removed opportunistically on each broker operation.
+
 ## Cross-Machine Use
 
 Prefer SSH tunneling:
@@ -90,3 +102,9 @@ python3 scripts/agentmessenger.py server --host 0.0.0.0 --port 8765 --token "$AG
 ```
 
 Share only the URL and token with trusted agents.
+
+Run the bundled end-to-end test after protocol changes:
+
+```bash
+python3 scripts/self_test_agentmessenger.py
+```

@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Small HTTP broker and CLI for Codex-to-Codex context exchange."""
+"""Small SQLite-backed broker and CLI for Codex-to-Codex context exchange."""
 
 from __future__ import annotations
 
@@ -9,6 +9,7 @@ import os
 import re
 import signal
 import socket
+import sqlite3
 import sys
 import threading
 import time
@@ -22,8 +23,10 @@ from typing import Any
 
 
 DEFAULT_URL = "http://127.0.0.1:8765"
+DEFAULT_DB = "~/.agentmessenger/broker.sqlite3"
 DEFAULT_TTL = 3600
 MAX_WAIT_SECONDS = 120
+VERSION = "0.2.0"
 
 
 def now() -> float:
@@ -47,6 +50,18 @@ def default_agent_name() -> str:
     user = os.environ.get("USER") or os.environ.get("USERNAME") or "codex"
     cwd = Path.cwd().name or socket.gethostname()
     return clean_agent_name(f"{user}-{cwd}")
+
+
+def default_db_path() -> str:
+    return os.environ.get("AGENTMESSENGER_DB", DEFAULT_DB)
+
+
+def resolve_db_path(value: str | None) -> str:
+    if not value:
+        value = default_db_path()
+    if value == ":memory:":
+        return value
+    return str(Path(value).expanduser())
 
 
 def read_context(text: str | None, file_path: str | None) -> str:
@@ -77,104 +92,169 @@ def parse_since(value: str | None) -> int:
     return int(match.group(1))
 
 
+def json_object(value: str | None) -> dict[str, Any]:
+    if not value:
+        return {}
+    loaded = json.loads(value)
+    return loaded if isinstance(loaded, dict) else {}
+
+
 class BrokerState:
-    def __init__(self, state_file: str | None = None) -> None:
-        self.state_file = Path(state_file).expanduser() if state_file else None
+    def __init__(self, db_path: str | None = None) -> None:
+        self.db_path = resolve_db_path(db_path)
+        if self.db_path != ":memory:":
+            Path(self.db_path).parent.mkdir(parents=True, exist_ok=True)
         self.lock = threading.RLock()
         self.condition = threading.Condition(self.lock)
-        self.agents: dict[str, dict[str, Any]] = {}
-        self.messages: list[dict[str, Any]] = []
-        self.next_seq = 1
-        self.load()
+        self.conn = sqlite3.connect(self.db_path, check_same_thread=False, isolation_level=None)
+        self.conn.row_factory = sqlite3.Row
+        self.conn.execute("PRAGMA busy_timeout = 5000")
+        if self.db_path != ":memory:":
+            self.conn.execute("PRAGMA journal_mode = WAL")
+        self.init_schema()
 
-    def load(self) -> None:
-        if not self.state_file or not self.state_file.exists():
-            return
-        data = json.loads(self.state_file.read_text(encoding="utf-8"))
-        self.agents = data.get("agents", {})
-        self.messages = data.get("messages", [])
-        self.next_seq = int(data.get("next_seq", 1))
+    def init_schema(self) -> None:
+        with self.lock:
+            self.conn.executescript(
+                """
+                CREATE TABLE IF NOT EXISTS agents (
+                    name TEXT PRIMARY KEY,
+                    summary TEXT NOT NULL DEFAULT '',
+                    workspace TEXT NOT NULL DEFAULT '',
+                    context TEXT NOT NULL DEFAULT '',
+                    metadata_json TEXT NOT NULL DEFAULT '{}',
+                    updated_at REAL NOT NULL,
+                    expires_at REAL NOT NULL
+                );
 
-    def save(self) -> None:
-        if not self.state_file:
-            return
-        self.state_file.parent.mkdir(parents=True, exist_ok=True)
-        payload = {
-            "agents": self.agents,
-            "messages": self.messages,
-            "next_seq": self.next_seq,
-        }
-        self.state_file.write_text(json.dumps(payload, indent=2, sort_keys=True), encoding="utf-8")
+                CREATE TABLE IF NOT EXISTS messages (
+                    seq INTEGER PRIMARY KEY,
+                    id TEXT UNIQUE NOT NULL,
+                    sender TEXT NOT NULL,
+                    recipient TEXT NOT NULL,
+                    kind TEXT NOT NULL,
+                    text TEXT NOT NULL DEFAULT '',
+                    context TEXT NOT NULL DEFAULT '',
+                    in_reply_to TEXT,
+                    thread_id TEXT NOT NULL,
+                    created_at REAL NOT NULL,
+                    expires_at REAL NOT NULL
+                );
+
+                CREATE TABLE IF NOT EXISTS message_consumed (
+                    message_id TEXT NOT NULL,
+                    agent TEXT NOT NULL,
+                    consumed_at REAL NOT NULL,
+                    PRIMARY KEY (message_id, agent),
+                    FOREIGN KEY (message_id) REFERENCES messages(id) ON DELETE CASCADE
+                );
+
+                CREATE INDEX IF NOT EXISTS idx_messages_recipient_seq
+                    ON messages(recipient, seq);
+                CREATE INDEX IF NOT EXISTS idx_messages_reply
+                    ON messages(in_reply_to);
+                """
+            )
+
+    def close(self) -> None:
+        with self.lock:
+            self.conn.close()
 
     def cleanup(self) -> None:
         current = now()
-        self.agents = {
-            name: agent
-            for name, agent in self.agents.items()
-            if agent.get("expires_at", 0) > current
-        }
-        self.messages = [
-            message
-            for message in self.messages
-            if message.get("expires_at", 0) > current
-        ]
+        self.conn.execute("DELETE FROM agents WHERE expires_at <= ?", (current,))
+        self.conn.execute(
+            "DELETE FROM message_consumed WHERE message_id IN "
+            "(SELECT id FROM messages WHERE expires_at <= ?)",
+            (current,),
+        )
+        self.conn.execute("DELETE FROM messages WHERE expires_at <= ?", (current,))
 
     def announce(self, agent_name: str, payload: dict[str, Any]) -> dict[str, Any]:
         with self.condition:
             self.cleanup()
             ttl = int(payload.get("ttl_seconds") or DEFAULT_TTL)
             timestamp = now()
-            agent = {
-                "name": agent_name,
-                "summary": str(payload.get("summary") or ""),
-                "workspace": str(payload.get("workspace") or ""),
-                "context": str(payload.get("context") or ""),
-                "metadata": payload.get("metadata") or {},
-                "updated_at": timestamp,
-                "expires_at": timestamp + ttl,
-            }
-            self.agents[agent_name] = agent
-            self.save()
+            metadata = payload.get("metadata") or {}
+            self.conn.execute(
+                """
+                INSERT INTO agents
+                    (name, summary, workspace, context, metadata_json, updated_at, expires_at)
+                VALUES (?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(name) DO UPDATE SET
+                    summary = excluded.summary,
+                    workspace = excluded.workspace,
+                    context = excluded.context,
+                    metadata_json = excluded.metadata_json,
+                    updated_at = excluded.updated_at,
+                    expires_at = excluded.expires_at
+                """,
+                (
+                    agent_name,
+                    str(payload.get("summary") or ""),
+                    str(payload.get("workspace") or ""),
+                    str(payload.get("context") or ""),
+                    json.dumps(metadata, sort_keys=True),
+                    timestamp,
+                    timestamp + ttl,
+                ),
+            )
+            agent = self.fetch_agent(agent_name)
             self.condition.notify_all()
-            return agent
+            return agent or {}
 
     def list_agents(self) -> list[dict[str, Any]]:
         with self.lock:
             self.cleanup()
-            return sorted(self.agents.values(), key=lambda item: item["name"])
+            rows = self.conn.execute("SELECT * FROM agents ORDER BY name").fetchall()
+            return [agent_from_row(row) for row in rows]
 
     def fetch_agent(self, agent_name: str) -> dict[str, Any] | None:
         with self.lock:
             self.cleanup()
-            return self.agents.get(agent_name)
+            row = self.conn.execute("SELECT * FROM agents WHERE name = ?", (agent_name,)).fetchone()
+            return agent_from_row(row) if row else None
+
+    def next_message_seq(self) -> int:
+        row = self.conn.execute("SELECT COALESCE(MAX(seq), 0) + 1 AS seq FROM messages").fetchone()
+        return int(row["seq"])
 
     def send_message(self, payload: dict[str, Any]) -> dict[str, Any]:
         with self.condition:
             self.cleanup()
             ttl = int(payload.get("ttl_seconds") or DEFAULT_TTL)
-            seq = self.next_seq
-            self.next_seq += 1
+            seq = self.next_message_seq()
             message_id = f"m{seq:06d}"
             thread_id = str(payload.get("thread_id") or payload.get("in_reply_to") or message_id)
             timestamp = now()
-            message = {
-                "id": message_id,
-                "seq": seq,
-                "sender": clean_agent_name(str(payload.get("sender") or "unknown")),
-                "recipient": clean_recipient(str(payload.get("recipient") or "*")),
-                "kind": str(payload.get("kind") or "note"),
-                "text": str(payload.get("text") or ""),
-                "context": str(payload.get("context") or ""),
-                "in_reply_to": payload.get("in_reply_to"),
-                "thread_id": thread_id,
-                "created_at": timestamp,
-                "expires_at": timestamp + ttl,
-                "consumed_by": [],
-            }
-            self.messages.append(message)
-            self.save()
+            self.conn.execute(
+                """
+                INSERT INTO messages
+                    (seq, id, sender, recipient, kind, text, context, in_reply_to,
+                     thread_id, created_at, expires_at)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    seq,
+                    message_id,
+                    clean_agent_name(str(payload.get("sender") or "unknown")),
+                    clean_recipient(str(payload.get("recipient") or "*")),
+                    str(payload.get("kind") or "note"),
+                    str(payload.get("text") or ""),
+                    str(payload.get("context") or ""),
+                    payload.get("in_reply_to"),
+                    thread_id,
+                    timestamp,
+                    timestamp + ttl,
+                ),
+            )
+            message = self.fetch_message(message_id)
             self.condition.notify_all()
-            return message
+            return message or {}
+
+    def fetch_message(self, message_id: str) -> dict[str, Any] | None:
+        row = self.conn.execute("SELECT * FROM messages WHERE id = ?", (message_id,)).fetchone()
+        return message_from_row(row) if row else None
 
     def get_messages(
         self,
@@ -189,31 +269,84 @@ class BrokerState:
         with self.condition:
             while True:
                 self.cleanup()
-                messages = [
-                    message
-                    for message in self.messages
-                    if message["seq"] > since
-                    and (message["recipient"] in {agent_name, "*"})
-                    and (include_consumed or agent_name not in message.get("consumed_by", []))
-                    and (not in_reply_to or message.get("in_reply_to") == in_reply_to)
-                ]
+                messages = self.query_messages(
+                    agent_name,
+                    since=since,
+                    include_consumed=include_consumed,
+                    in_reply_to=in_reply_to,
+                )
                 if messages or now() >= deadline:
                     if consume and messages:
-                        for message in messages:
-                            consumed_by = message.setdefault("consumed_by", [])
-                            if agent_name not in consumed_by:
-                                consumed_by.append(agent_name)
-                        self.save()
-                    return [public_message(message) for message in messages]
+                        timestamp = now()
+                        self.conn.executemany(
+                            """
+                            INSERT OR IGNORE INTO message_consumed
+                                (message_id, agent, consumed_at)
+                            VALUES (?, ?, ?)
+                            """,
+                            [(message["id"], agent_name, timestamp) for message in messages],
+                        )
+                    return messages
                 self.condition.wait(timeout=max(0.1, deadline - now()))
 
+    def query_messages(
+        self,
+        agent_name: str,
+        since: int,
+        include_consumed: bool,
+        in_reply_to: str | None,
+    ) -> list[dict[str, Any]]:
+        conditions = [
+            "messages.seq > ?",
+            "(messages.recipient = ? OR messages.recipient = '*')",
+        ]
+        params: list[Any] = [since, agent_name]
+        if not include_consumed:
+            conditions.append(
+                "NOT EXISTS ("
+                "SELECT 1 FROM message_consumed "
+                "WHERE message_consumed.message_id = messages.id "
+                "AND message_consumed.agent = ?)"
+            )
+            params.append(agent_name)
+        if in_reply_to:
+            conditions.append("messages.in_reply_to = ?")
+            params.append(in_reply_to)
+        sql = f"SELECT * FROM messages WHERE {' AND '.join(conditions)} ORDER BY seq"
+        rows = self.conn.execute(sql, params).fetchall()
+        return [message_from_row(row) for row in rows]
 
-def public_message(message: dict[str, Any]) -> dict[str, Any]:
-    return {key: value for key, value in message.items() if key != "consumed_by"}
+
+def agent_from_row(row: sqlite3.Row) -> dict[str, Any]:
+    return {
+        "name": row["name"],
+        "summary": row["summary"],
+        "workspace": row["workspace"],
+        "context": row["context"],
+        "metadata": json_object(row["metadata_json"]),
+        "updated_at": row["updated_at"],
+        "expires_at": row["expires_at"],
+    }
+
+
+def message_from_row(row: sqlite3.Row) -> dict[str, Any]:
+    return {
+        "id": row["id"],
+        "seq": row["seq"],
+        "sender": row["sender"],
+        "recipient": row["recipient"],
+        "kind": row["kind"],
+        "text": row["text"],
+        "context": row["context"],
+        "in_reply_to": row["in_reply_to"],
+        "thread_id": row["thread_id"],
+        "created_at": row["created_at"],
+        "expires_at": row["expires_at"],
+    }
 
 
 class BrokerHandler(BaseHTTPRequestHandler):
-    server_version = "AgentMessenger/0.1"
+    server_version = f"AgentMessenger/{VERSION}"
 
     @property
     def broker(self) -> BrokerState:
@@ -236,7 +369,16 @@ class BrokerHandler(BaseHTTPRequestHandler):
         query = urllib.parse.parse_qs(parsed.query)
         try:
             if path == "/health":
-                self.write_json({"ok": True, "service": "agentmessenger", "time": now()})
+                self.write_json(
+                    {
+                        "ok": True,
+                        "service": "agentmessenger",
+                        "version": VERSION,
+                        "storage": "sqlite",
+                        "db": self.broker.db_path,
+                        "time": now(),
+                    }
+                )
             elif path == "/agents":
                 self.write_json({"agents": self.broker.list_agents()})
             elif path.startswith("/agents/") and path.endswith("/context"):
@@ -247,8 +389,8 @@ class BrokerHandler(BaseHTTPRequestHandler):
                 else:
                     self.write_json({"agent": agent})
             elif path == "/messages":
-                agent_name = clean_agent_name(one(query, "agent", default_agent_name()))
-                wait_seconds = float(one(query, "wait", "0"))
+                agent_name = clean_agent_name(str(one(query, "agent", default_agent_name())))
+                wait_seconds = float(str(one(query, "wait", "0")))
                 since = parse_since(one(query, "since", "0"))
                 consume = one(query, "consume", "0") in {"1", "true", "yes"}
                 include_consumed = one(query, "include_consumed", "0") in {"1", "true", "yes"}
@@ -287,7 +429,7 @@ class BrokerHandler(BaseHTTPRequestHandler):
                 self.write_json({"agent": agent})
             elif path == "/messages":
                 message = self.broker.send_message(body)
-                self.write_json({"message": public_message(message)})
+                self.write_json({"message": message})
             else:
                 self.write_json({"error": "not found"}, HTTPStatus.NOT_FOUND)
         except Exception as exc:  # pragma: no cover - surfaced to CLI.
@@ -324,7 +466,8 @@ def one(query: dict[str, list[str]], key: str, default: str | None = "") -> str 
 
 
 def run_server(args: argparse.Namespace) -> int:
-    broker = BrokerState(args.state)
+    db_path = args.db or args.state or default_db_path()
+    broker = BrokerState(db_path)
     server = ThreadingHTTPServer((args.host, args.port), BrokerHandler)
     server.broker = broker  # type: ignore[attr-defined]
     server.token = args.token or os.environ.get("AGENTMESSENGER_TOKEN")  # type: ignore[attr-defined]
@@ -334,8 +477,11 @@ def run_server(args: argparse.Namespace) -> int:
         raise KeyboardInterrupt
 
     signal.signal(signal.SIGTERM, stop)
-    url = f"http://{args.host}:{args.port}"
+    host, port = server.server_address[:2]
+    display_host = args.host if args.host != "0.0.0.0" else host
+    url = f"http://{display_host}:{port}"
     print(f"AgentMessenger broker listening at {url}", flush=True)
+    print(f"SQLite database: {broker.db_path}", flush=True)
     if server.token:  # type: ignore[attr-defined]
         print("Token auth is enabled. Set AGENTMESSENGER_TOKEN in each client session.", flush=True)
     elif args.host not in {"127.0.0.1", "localhost", "::1"}:
@@ -346,13 +492,15 @@ def run_server(args: argparse.Namespace) -> int:
         print("\nAgentMessenger broker stopped.", flush=True)
     finally:
         server.server_close()
+        broker.close()
     return 0
 
 
 class Client:
-    def __init__(self, url: str, token: str | None = None) -> None:
+    def __init__(self, url: str, token: str | None = None, timeout: float = MAX_WAIT_SECONDS + 10) -> None:
         self.url = url.rstrip("/")
         self.token = token
+        self.timeout = timeout
 
     def request(self, method: str, path: str, body: dict[str, Any] | None = None) -> dict[str, Any]:
         data = None
@@ -364,7 +512,7 @@ class Client:
             headers["X-AgentMessenger-Token"] = self.token
         request = urllib.request.Request(f"{self.url}{path}", data=data, headers=headers, method=method)
         try:
-            with urllib.request.urlopen(request, timeout=MAX_WAIT_SECONDS + 10) as response:
+            with urllib.request.urlopen(request, timeout=self.timeout) as response:
                 return json.loads(response.read().decode("utf-8"))
         except urllib.error.HTTPError as exc:
             detail = exc.read().decode("utf-8")
@@ -373,8 +521,12 @@ class Client:
             raise SystemExit(f"Could not reach AgentMessenger broker at {self.url}: {exc.reason}") from exc
 
 
-def make_client(args: argparse.Namespace) -> Client:
-    return Client(args.url or os.environ.get("AGENTMESSENGER_URL", DEFAULT_URL), args.token or os.environ.get("AGENTMESSENGER_TOKEN"))
+def make_client(args: argparse.Namespace, timeout: float = MAX_WAIT_SECONDS + 10) -> Client:
+    return Client(
+        args.url or os.environ.get("AGENTMESSENGER_URL", DEFAULT_URL),
+        args.token or os.environ.get("AGENTMESSENGER_TOKEN"),
+        timeout=timeout,
+    )
 
 
 def cmd_status(args: argparse.Namespace) -> int:
@@ -428,6 +580,8 @@ def cmd_fetch(args: argparse.Namespace) -> int:
         print(f"workspace: {agent_payload['workspace']}")
     if agent_payload.get("summary"):
         print(f"summary: {agent_payload['summary']}")
+    if agent_payload.get("metadata"):
+        print(f"metadata: {json.dumps(agent_payload['metadata'], sort_keys=True)}")
     if agent_payload.get("context"):
         print("\ncontext:")
         print(agent_payload["context"])
@@ -445,7 +599,7 @@ def cmd_ask(args: argparse.Namespace) -> int:
         "context": read_context(args.context, args.context_file),
         "ttl_seconds": args.ttl,
     }
-    client = make_client(args)
+    client = make_client(args, timeout=args.timeout + 10)
     result = client.request("POST", "/messages", payload)
     message = result["message"]
     if args.json and not args.wait:
@@ -470,14 +624,14 @@ def cmd_ask(args: argparse.Namespace) -> int:
 def cmd_inbox(args: argparse.Namespace) -> int:
     agent = clean_agent_name(args.agent or os.environ.get("AGENTMESSENGER_AGENT") or default_agent_name())
     wait = args.timeout if args.wait else 0
-    consume = "0" if args.no_consume else "1"
+    consume = "0" if args.no_consume or args.peek else "1"
     include = "1" if args.include_consumed else "0"
     path = (
         f"/messages?agent={urllib.parse.quote(agent)}"
         f"&wait={int(wait)}&consume={consume}"
         f"&include_consumed={include}&since={urllib.parse.quote(args.since or '0')}"
     )
-    result = make_client(args).request("GET", path)
+    result = make_client(args, timeout=wait + 10).request("GET", path)
     if args.json:
         emit(args, result)
     else:
@@ -558,13 +712,15 @@ def add_context_options(parser: argparse.ArgumentParser) -> None:
 
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="AgentMessenger broker and CLI")
+    parser.add_argument("--version", action="version", version=f"agentmessenger {VERSION}")
     subparsers = parser.add_subparsers(dest="command", required=True)
 
     server = subparsers.add_parser("server", help="start broker")
     server.add_argument("--host", default="127.0.0.1")
     server.add_argument("--port", type=int, default=8765)
     server.add_argument("--token", default=os.environ.get("AGENTMESSENGER_TOKEN"))
-    server.add_argument("--state", help="optional JSON state file")
+    server.add_argument("--db", default=os.environ.get("AGENTMESSENGER_DB"), help=f"SQLite DB path; default {DEFAULT_DB}")
+    server.add_argument("--state", help="deprecated alias for --db")
     server.add_argument("--quiet", action="store_true")
     server.set_defaults(func=run_server)
 
@@ -610,6 +766,7 @@ def build_parser() -> argparse.ArgumentParser:
     inbox.add_argument("--since", default="0")
     inbox.add_argument("--include-consumed", action="store_true")
     inbox.add_argument("--no-consume", action="store_true")
+    inbox.add_argument("--peek", action="store_true", help="show messages without marking them consumed")
     inbox.set_defaults(func=cmd_inbox)
 
     reply = subparsers.add_parser("reply", help="reply to a context request")
