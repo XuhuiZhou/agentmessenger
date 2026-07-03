@@ -208,6 +208,9 @@ def main() -> int:
             )
             assert hosted["agent"] == "owner"
             assert hosted["join_code"].startswith("am_join_")
+            assert hosted["repo_url"] == "https://github.com/XuhuiZhou/agentmessenger"
+            assert hosted["join_code"] in hosted["share_text"]
+            assert hosted["repo_url"] in hosted["share_text"]
             assert host_config.exists()
 
             joined = json_cli(
@@ -248,6 +251,8 @@ def main() -> int:
             )
             assert dana_invite["contact"] == "Dana"
             assert dana_invite["join_code"].startswith("am_join_")
+            assert "Dana contact inbox" in dana_invite["share_text"]
+            assert dana_invite["join_code"] in dana_invite["share_text"]
             dana_joined = json_cli(
                 url,
                 "join",
@@ -294,6 +299,8 @@ def main() -> int:
             try:
                 assert secure_host["url"].startswith("https://")
                 assert len(secure_host["tls_fingerprint"]) == 64
+                assert secure_host["join_code"] in secure_host["share_text"]
+                assert secure_host["repo_url"] == "https://github.com/XuhuiZhou/agentmessenger"
                 secure_join = json.loads(
                     run_raw(
                         "join",

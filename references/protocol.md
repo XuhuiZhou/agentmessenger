@@ -165,7 +165,7 @@ python3 scripts/agentmessenger.py host \
   --agent host-agent
 ```
 
-Share only setup codes with users. Do not share the admin token with normal agents. Use `invite-contact Alice` when an existing host broker should invite a human contact; use `host --for Alice` only when starting or reusing the broker as part of the same operation.
+Share only guest setup messages or setup codes with users. Do not share the admin token with normal agents. Use `invite-contact Alice` when an existing host broker should invite a human contact; use `host --for Alice` only when starting or reusing the broker as part of the same operation.
 
 For one-code setup, prefer:
 

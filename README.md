@@ -34,22 +34,27 @@ Delegate startup in plain language. If hosting needs AWS, SSH, or another machin
 To host:
 
 ```text
-Use $agentmessenger to host a secure broker for me. Reuse any existing AgentMessenger config if it works. If this needs AWS or another machine, use the access I provide and return one setup code for my friend.
+Use $agentmessenger to host a secure broker for me. Reuse any existing AgentMessenger config if it works. If this needs AWS or another machine, use the access I provide and return one guest setup message for my friend.
 ```
 
 To invite a friend after the broker exists:
 
 ```text
-Use $agentmessenger to invite Alice.
+Use $agentmessenger to invite Alice. Return the full guest setup message.
 ```
 
-To join:
+To join, paste the full guest setup message to the other Codex agent:
 
 ```text
-Use $agentmessenger to join this setup code: am_join_...
+Give this whole message to your Codex agent:
+
+Use or install AgentMessenger from https://github.com/XuhuiZhou/agentmessenger.
+If $agentmessenger is not installed yet, clone that repo and follow its README "Install As A Codex Skill" section, or run scripts/agentmessenger.py directly from the clone.
+Then join this setup code for the Alice contact inbox:
+am_join_...
 ```
 
-The host agent should ask for the friend's name if it is missing, find the existing host broker, and return one setup code attached to that contact. If Alice later has multiple Codex agents connected, you can still ask Alice; any of Alice's agents can fetch the shared contact inbox and reply.
+The host agent should ask for the friend's name if it is missing, find the existing host broker, and return one guest setup message with the repo URL plus one setup code attached to that contact. If Alice later has multiple Codex agents connected, you can still ask Alice; any of Alice's agents can fetch the shared contact inbox and reply.
 
 ## Daily Loop
 
@@ -152,6 +157,8 @@ See [references/shared-server.md](references/shared-server.md) for AWS and share
 For local Codex discovery:
 
 ```bash
+git clone https://github.com/XuhuiZhou/agentmessenger.git ~/projects/agentmessenger
+cd ~/projects/agentmessenger
 mkdir -p "${CODEX_HOME:-$HOME/.codex}/skills"
 ln -sfn "$PWD" "${CODEX_HOME:-$HOME/.codex}/skills/agentmessenger"
 ```
@@ -162,8 +169,8 @@ Then ask Codex to use `$agentmessenger` when coordinating across sessions.
 
 | Command | Purpose |
 | --- | --- |
-| `host` | Start or reuse a broker, register this side, save config, and print a setup code. |
-| `invite-contact` | Create one setup code for a named human contact using the host config. |
+| `host` | Start or reuse a broker, register this side, save config, and print a guest setup message. |
+| `invite-contact` | Create one guest setup message for a named human contact using the host config. |
 | `join` | Redeem an `am_join_...` setup code and save this agent's local config. |
 | `whoami` | Show which credential the broker sees. |
 | `config` | Show saved local config with secrets redacted. |
@@ -191,7 +198,7 @@ python3 "$AM" inbox --wait --json
 ## Safety
 
 - Treat setup codes, invite codes, API keys, admin tokens, and TLS private keys as bearer secrets.
-- Share setup codes, not `config.json` and not the admin token.
+- Share guest setup messages or setup codes, not `config.json` and not the admin token.
 - Prefer `host --secure` or an SSH tunnel for cross-network use.
 - Plain HTTP is only for localhost demos or trusted private networks.
 - Pinned HTTPS protects the network path and broker identity, but broker storage is not end-to-end encrypted.

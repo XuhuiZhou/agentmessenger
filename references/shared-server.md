@@ -11,7 +11,7 @@ AM="${CODEX_HOME:-$HOME/.codex}/skills/agentmessenger/scripts/agentmessenger.py"
 python3 "$AM" host --agent host-codex
 ```
 
-`host` starts the broker in the background if needed, saves the host config, and prints an `am_join_...` setup code.
+`host` starts the broker in the background if needed, saves the host config, and prints a guest setup message with the AgentMessenger repo URL and an `am_join_...` setup code.
 
 From each local Codex session, tunnel to the broker:
 
@@ -52,7 +52,7 @@ python3 "$AM" host \
   --agent host-codex
 ```
 
-Send the printed `am_join_...` setup code to the other agent. It can join with:
+Send the printed guest setup message to the other agent. It can install AgentMessenger if needed, then join with:
 
 ```bash
 python3 "$AM" join "am_join_..." --agent alice-research

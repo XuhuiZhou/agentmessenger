@@ -38,7 +38,8 @@ DEFAULT_TTL = 3600
 DEFAULT_INVITE_TTL = 7 * 24 * 3600
 MAX_WAIT_SECONDS = 120
 JOIN_CODE_PREFIX = "am_join_"
-VERSION = "0.6.1"
+VERSION = "0.6.2"
+REPO_URL = "https://github.com/XuhuiZhou/agentmessenger"
 
 
 class BrokerError(Exception):
@@ -1257,6 +1258,7 @@ def cmd_invite_contact(args: argparse.Namespace) -> int:
         note=args.note,
         tls_fingerprint=tls_fingerprint,
     )
+    share_text = build_guest_share_text(join_code, contact)
     saved = {
         **config,
         "url": url,
@@ -1272,12 +1274,15 @@ def cmd_invite_contact(args: argparse.Namespace) -> int:
         "join_code": join_code,
         "invite": invite,
         "tls_fingerprint": tls_fingerprint,
+        "repo_url": REPO_URL,
+        "share_text": share_text,
     }
     if args.json:
         emit(args, result)
     else:
-        print(f"Setup code for {contact}:")
-        print(join_code)
+        print(f"AgentMessenger invite is ready for {contact}.")
+        print("\nSend this whole message to your friend:")
+        print(share_text)
     return 0
 
 
@@ -1420,6 +1425,26 @@ def make_join_code(
     return encode_join_code(payload)
 
 
+def build_guest_share_text(join_code: str, contact: str = "") -> str:
+    contact_hint = f" for the {contact} contact inbox" if contact else ""
+    return "\n".join(
+        [
+            "Give this whole message to your Codex agent:",
+            "",
+            f"Use or install AgentMessenger from {REPO_URL}.",
+            (
+                "If $agentmessenger is not installed yet, clone that repo and follow its "
+                'README "Install As A Codex Skill" section, or run scripts/agentmessenger.py '
+                "directly from the clone."
+            ),
+            f"Then join this setup code{contact_hint}:",
+            join_code,
+            "",
+            "After joining, verify with whoami, announce useful context, and watch inbox --wait.",
+        ]
+    )
+
+
 def cmd_host(args: argparse.Namespace) -> int:
     config_path = resolve_config_path(args.config)
     config = load_config(config_path)
@@ -1499,6 +1524,7 @@ def cmd_host(args: argparse.Namespace) -> int:
         note=args.note,
         tls_fingerprint=tls_fingerprint,
     )
+    share_text = build_guest_share_text(join_code, invite_contact)
 
     saved = {
         **config,
@@ -1533,6 +1559,8 @@ def cmd_host(args: argparse.Namespace) -> int:
         "tls_fingerprint": tls_fingerprint,
         "contact": host_contact,
         "invite_contact": invite_contact,
+        "repo_url": REPO_URL,
+        "share_text": share_text,
     }
     if args.json:
         emit(args, result)
@@ -1548,10 +1576,8 @@ def cmd_host(args: argparse.Namespace) -> int:
             print("warning: public HTTP is not encrypted; prefer --secure for real conversations")
         if server_pid:
             print(f"server pid: {server_pid}")
-        print("\nSend this setup code to your friend:")
-        print(join_code)
-        print("\nYour friend can run:")
-        print(f"python3 {Path(__file__).resolve()} join {join_code}")
+        print("\nSend this whole message to your friend:")
+        print(share_text)
     return 0
 
 
@@ -1896,7 +1922,7 @@ def build_parser() -> argparse.ArgumentParser:
     add_client_options(status)
     status.set_defaults(func=cmd_status)
 
-    host = subparsers.add_parser("host", help="start or connect to a broker and print a one-use setup code")
+    host = subparsers.add_parser("host", help="start or connect to a broker and print a guest setup message")
     add_client_options(host)
     host.add_argument("--host", default="127.0.0.1", help="bind host when starting a broker")
     host.add_argument("--port", type=int, default=8765)
@@ -1910,7 +1936,7 @@ def build_parser() -> argparse.ArgumentParser:
     host.add_argument("--agent")
     host.add_argument("--display-name")
     host.add_argument("--contact", help="human/contact name for the host agent")
-    host.add_argument("--for", dest="for_contact", help="human/contact name for the generated setup code")
+    host.add_argument("--for", dest="for_contact", help="human/contact name for the generated guest setup message")
     host.add_argument("--label", default="", help="label for the friend invite")
     host.add_argument("--max-uses", type=int, default=1)
     host.add_argument("--ttl", type=int, default=DEFAULT_INVITE_TTL)
@@ -1944,7 +1970,7 @@ def build_parser() -> argparse.ArgumentParser:
     add_client_options(invites)
     invites.set_defaults(func=cmd_invites)
 
-    invite_contact = subparsers.add_parser("invite-contact", help="create one setup code for a named human contact")
+    invite_contact = subparsers.add_parser("invite-contact", help="create one guest setup message for a named human contact")
     add_client_options(invite_contact)
     invite_contact.add_argument("contact", help="human/contact name, for example Alice")
     invite_contact.add_argument("--public-url", help="URL embedded in the setup code; required if saved URL is local-only")

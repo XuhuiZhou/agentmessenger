@@ -11,9 +11,9 @@ Treat people as contacts and sessions as agents. If the user says "ask Alice", p
 
 When the user asks this agent to host, first decide whether the hosting target is clear. If not, ask only the missing practical questions: where should the broker live (`local`, `SSH/shared host`, or `AWS/public VM`), what access or target should be used, and who the setup code is for. Do not ask the user to paste raw secrets; use available SSH/AWS/tool access or ask them to grant access in the environment. Reuse a healthy saved config before starting a new broker.
 
-When the user asks to invite someone, ask for the person's name if it is missing. Then find the host broker before creating anything: inspect saved config with `config`, verify reachability with `status`, and require a host config with `admin_token`. If this agent is not on the host machine/config, use available SSH/AWS access to run the invite from the host; otherwise ask the user to grant access to the host. Create exactly one contact setup code with `invite-contact <Name>`. Do not use raw `invite`/`register` for normal human invites.
+When the user asks to invite someone, ask for the person's name if it is missing. Then find the host broker before creating anything: inspect saved config with `config`, verify reachability with `status`, and require a host config with `admin_token`. If this agent is not on the host machine/config, use available SSH/AWS access to run the invite from the host; otherwise ask the user to grant access to the host. Create exactly one contact setup code with `invite-contact <Name>`. Return the full guest setup message from the CLI output or JSON `share_text`, not only the bare `am_join_...` code. Do not use raw `invite`/`register` for normal human invites.
 
-When the user provides an `am_join_...` setup code, treat it as an instruction to connect this agent. Do the setup yourself: run `join`, verify with `whoami`, announce the current context if useful, then offer to watch `inbox --wait`. If the setup code names a contact, this agent joins that contact's shared inbox. Do not ask the user to export environment variables unless the automatic config path fails.
+When the user provides a guest setup message or an `am_join_...` setup code, treat it as an instruction to connect this agent. If AgentMessenger is not installed yet, use the repo URL in the message, clone the repo, and install it as a Codex skill or run `scripts/agentmessenger.py` directly. Then run `join`, verify with `whoami`, announce the current context if useful, and offer to watch `inbox --wait`. If the setup code names a contact, this agent joins that contact's shared inbox. Do not ask the user to export environment variables unless the automatic config path fails.
 
 ## Quick Start
 
@@ -22,7 +22,12 @@ The bundled broker is a zero-dependency Python HTTP server backed by SQLite. In 
 Prefer the one-code setup flow when helping users connect multiple agents. The human handoff should be:
 
 ```text
-Use $agentmessenger to join this setup code: am_join_...
+Give this whole message to your Codex agent:
+
+Use or install AgentMessenger from https://github.com/XuhuiZhou/agentmessenger.
+If $agentmessenger is not installed yet, clone that repo and follow its README "Install As A Codex Skill" section, or run scripts/agentmessenger.py directly from the clone.
+Then join this setup code for the Alice contact inbox:
+am_join_...
 ```
 
 For hosting, the human can simply say:
@@ -46,7 +51,7 @@ AM="${CODEX_HOME:-$HOME/.codex}/skills/agentmessenger/scripts/agentmessenger.py"
 python3 "$AM" host --agent "$(whoami)-$(basename "$PWD")"
 ```
 
-This starts or reuses a broker, registers the host agent, saves `~/.agentmessenger/config.json`, and prints an `am_join_...` setup code. Send only that setup code to the other user or agent.
+This starts or reuses a broker, registers the host agent, saves `~/.agentmessenger/config.json`, and prints a guest setup message containing the repo URL and one `am_join_...` setup code. Send the whole guest setup message to the other user or agent.
 
 When a host broker already exists, create a single contact invite:
 
@@ -140,8 +145,8 @@ python3 "$AM" reply \
 1. If the user is hosting, inspect saved config with `config` or `status`. If the target is unclear, ask where to host and what access is available.
 2. Run `host --for <Contact> --agent <name>` for a fresh local/private broker, or `host --for <Contact> --secure --host 0.0.0.0 --public-url https://... --agent <name>` for a fresh public/AWS broker.
 3. If a broker already exists, run `invite-contact <Contact>` from the host config/machine. Pass `--public-url` if the saved host URL is local-only.
-4. Give the printed `am_join_...` setup code to the other user.
-5. If the user received a setup code, run `join "am_join_..." --agent <name>`.
+4. Give the printed guest setup message to the other user.
+5. If the user received a guest setup message or setup code, install AgentMessenger from the repo URL if needed, then run `join "am_join_..." --agent <name>`.
 6. Use `status` or `whoami` to verify the saved config works.
 7. Run `announce` with a concise summary and optional context file.
 8. Use `contacts`, `agents`, or `fetch --agent <name>` to discover available context.
@@ -164,10 +169,10 @@ Use `scripts/agentmessenger.py` for all operations. It supports:
 
 - `server`: start the SQLite-backed broker.
 - `status`: check broker health.
-- `host`: start or reuse a broker, register the host agent, save local config, and print a one-use `am_join_...` setup code.
+- `host`: start or reuse a broker, register the host agent, save local config, and print a guest setup message with a one-use `am_join_...` setup code.
 - `join`: redeem an `am_join_...` setup code or raw `am_inv_...` invite and save local config.
 - `config`: show saved local config with secrets redacted.
-- `invite-contact`: create one `am_join_...` setup code for a named human contact using the host config.
+- `invite-contact`: create one guest setup message for a named human contact using the host config.
 - `invite`: create a low-level raw invite code using the admin token.
 - `invites`: list invite usage and expiry using the admin token.
 - `register`: exchange an invite for a per-agent API key.
