@@ -945,12 +945,13 @@ class Client:
         if self.api_key:
             headers["X-AgentMessenger-Api-Key"] = self.api_key
         request = urllib.request.Request(f"{self.url}{path}", data=data, headers=headers, method=method)
+        scheme = urllib.parse.urlparse(self.url).scheme
         try:
             context = None
-            if urllib.parse.urlparse(self.url).scheme == "https" and self.tls_fingerprint:
+            if scheme == "https" and self.tls_fingerprint:
                 context = ssl._create_unverified_context()
             with urllib.request.urlopen(request, timeout=self.timeout, context=context) as response:
-                if self.tls_fingerprint:
+                if scheme == "https" and self.tls_fingerprint:
                     self.verify_tls_fingerprint(response)
                 return json.loads(response.read().decode("utf-8"))
         except urllib.error.HTTPError as exc:
@@ -985,14 +986,17 @@ def make_client(
     api_key = getattr(args, "api_key", None) or os.environ.get("AGENTMESSENGER_API_KEY")
     if not api_key:
         api_key = str(config.get("api_key") or "") or None
+    url = getattr(args, "url", None) or os.environ.get("AGENTMESSENGER_URL") or str(config.get("url") or DEFAULT_URL)
     tls_fingerprint = (
         getattr(args, "tls_fingerprint", None)
         or os.environ.get("AGENTMESSENGER_TLS_FINGERPRINT")
         or str(config.get("tls_fingerprint") or "")
         or None
     )
+    if urllib.parse.urlparse(url).scheme != "https":
+        tls_fingerprint = None
     return Client(
-        getattr(args, "url", None) or os.environ.get("AGENTMESSENGER_URL") or str(config.get("url") or DEFAULT_URL),
+        url,
         token=token,
         api_key=api_key,
         tls_fingerprint=tls_fingerprint,
