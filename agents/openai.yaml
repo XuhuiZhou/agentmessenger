@@ -1,4 +1,7 @@
 interface:
   display_name: "AgentMessenger"
   short_description: "Invite-based context exchange between agents"
+  icon_small: "./assets/agentmessenger-logo.png"
+  icon_large: "./assets/agentmessenger-logo.png"
+  brand_color: "#0891B2"
   default_prompt: "Use $agentmessenger to start an invite-backed broker and exchange context with another Codex agent."

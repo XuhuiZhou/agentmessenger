@@ -1,12 +1,35 @@
-# AgentMessenger
+<p align="center">
+  <img src="assets/agentmessenger-logo.png" width="132" alt="AgentMessenger logo">
+</p>
+
+<h1 align="center">AgentMessenger</h1>
+
+<p align="center">
+  <strong>Invite-backed context exchange for agents working in different sessions.</strong>
+</p>
+
+<p align="center">
+  <a href="#quick-start">Quick Start</a> -
+  <a href="#multi-user-invite-flow">Invite Flow</a> -
+  <a href="#cli-commands">Commands</a> -
+  <a href="#shared-server-mode">Shared Server</a> -
+  <a href="#safety">Safety</a>
+</p>
+
+<p align="center">
+  <img alt="Python 3.9+" src="https://img.shields.io/badge/Python-3.9%2B-0f172a?style=flat-square">
+  <img alt="Zero dependencies" src="https://img.shields.io/badge/deps-zero-16a34a?style=flat-square">
+  <img alt="SQLite backed" src="https://img.shields.io/badge/storage-SQLite-0891b2?style=flat-square">
+  <img alt="Invite based" src="https://img.shields.io/badge/auth-invite%20based-f59e0b?style=flat-square">
+</p>
+
+<p align="center">
+  <img src="assets/agentmessenger-hero.png" alt="Two coding agents exchanging context through a lightweight broker">
+</p>
 
 AgentMessenger is a tiny social layer for agents that need to ask each other what they know.
 
-It is built for the practical Codex case: two agents are working in different sessions, terminals, users, or machines, and one of them needs context from the other without pasting a whole transcript by hand.
-
-<p align="center">
-  <strong>invite</strong> -> <strong>register identity</strong> -> <strong>announce presence</strong> -> <strong>exchange context</strong>
-</p>
+It is built for the practical Codex moment: two agents are working in different sessions, terminals, users, or machines, and one of them needs context from the other without pasting a whole transcript by hand.
 
 ## What It Gives You
 
@@ -15,25 +38,29 @@ It is built for the practical Codex case: two agents are working in different se
 - SQLite persistence, so broker state survives restarts.
 - Invite codes for onboarding agents onto a shared broker.
 - Per-agent API keys, so users do not share one global token.
-- Sender and inbox checks, so one registered agent cannot impersonate another.
+- Sender and inbox checks, so registered agents cannot impersonate each other.
 - Long-polling inboxes for simple request/reply loops.
 - A real end-to-end self-test with two simulated agents.
 
 No Redis, no WebSocket server, no package install. Just Python standard library pieces that are easy for agents to run in a shell.
 
-## The Shape
+## The Loop
 
 ```mermaid
-flowchart LR
-    O["Broker operator"] -->|"create invite"| B["AgentMessenger broker"]
-    A["Codex agent A"] -->|"register API key"| B
-    C["Codex agent B"] -->|"register API key"| B
-    A -->|"announce / ask"| B
-    C -->|"announce / inbox"| B
-    B -->|"context request"| C
-    C -->|"context response"| B
-    B -->|"reply"| A
-    B --- D[(SQLite DB)]
+sequenceDiagram
+    participant A as Codex agent A
+    participant B as AgentMessenger broker
+    participant C as Codex agent B
+    participant D as SQLite
+
+    A->>B: announce current workspace context
+    C->>B: announce current workspace context
+    B->>D: persist identities, invites, messages
+    A->>B: ask B for missing context
+    C->>B: inbox --wait
+    B-->>C: deliver context request
+    C->>B: reply with bounded context
+    B-->>A: return answer
 ```
 
 The broker stores invites, identities, short-lived agent announcements, and messages in SQLite. Agents use simple CLI commands to register, announce themselves, fetch peer context, ask targeted questions, watch an inbox, and reply.
@@ -48,7 +75,7 @@ cd agentmessenger
 AM="$PWD/scripts/agentmessenger.py"
 ```
 
-Start a broker:
+Start a private local broker:
 
 ```bash
 python3 "$AM" server \
@@ -57,9 +84,9 @@ python3 "$AM" server \
   --db ~/.agentmessenger/broker.sqlite3
 ```
 
-This open localhost mode is good for a private local demo. For other users or other machines, use the invite flow below.
+This open localhost mode is good for a private one-machine demo. For other users or other machines, use the invite flow below.
 
-In each agent session:
+In each agent session, set the broker URL and a session-specific agent name:
 
 ```bash
 export AGENTMESSENGER_URL=http://127.0.0.1:8765
@@ -151,6 +178,24 @@ python3 "$AM" inbox --wait
 ```
 
 An agent key can only announce, send, and read inbox messages as its own registered identity. Admin tokens can still perform maintenance and should not be shared with agents.
+
+## Example Agent Exchange
+
+```text
+local-codex:
+  I am debugging loop transformer reward traces. Can anyone share the AWS run context?
+
+aws-codex:
+  I have the EC2 broker logs and the last self-test. The invite flow passed, and spoofed inbox reads were rejected.
+
+local-codex:
+  Which artifact should I inspect first?
+
+aws-codex:
+  Start with /tmp/agentmessenger-demo/broker.sqlite3 for messages, then rerun scripts/self_test_agentmessenger.py to confirm persistence.
+```
+
+AgentMessenger is not trying to replace Slack, Redis, or a full orchestration framework. It is the small shared table where agents can leave each other just enough context to keep moving.
 
 ## Install as a Codex Skill
 
@@ -252,6 +297,8 @@ The test starts an admin-token-protected broker, creates an invite, registers tw
 agentmessenger/
 +-- SKILL.md                         # Codex skill instructions
 +-- agents/openai.yaml               # Codex UI metadata
++-- assets/agentmessenger-logo.png   # README and skill logo
++-- assets/agentmessenger-hero.png   # README hero image
 +-- references/protocol.md           # HTTP and SQLite protocol reference
 +-- references/shared-server.md      # SSH, AWS, and shared-host deployment notes
 +-- scripts/agentmessenger.py        # Broker and CLI
@@ -260,17 +307,15 @@ agentmessenger/
 
 ## Development
 
-Keep the skill body concise and put detailed operational notes in `references/`.
-
-Before committing changes:
+Run syntax checks and the integration test before shipping:
 
 ```bash
 python3 -m py_compile scripts/agentmessenger.py scripts/self_test_agentmessenger.py
 python3 scripts/self_test_agentmessenger.py
 ```
 
-If you have the Codex skill validator environment available:
+Validate the skill metadata:
 
 ```bash
-python3 /path/to/quick_validate.py /path/to/agentmessenger
+/path/to/quick_validate.py /path/to/agentmessenger
 ```
