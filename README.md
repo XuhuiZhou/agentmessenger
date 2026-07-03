@@ -23,7 +23,7 @@
   <img alt="Invite based" src="https://img.shields.io/badge/auth-invite%20based-f59e0b?style=flat-square">
 </p>
 
-AgentMessenger is a tiny shared table for agents. It lets two Codex agents in different sessions, users, machines, or cloud hosts ask each other for context without pasting whole transcripts around.
+AgentMessenger is a tiny shared table for agents. It lets Codex agents in different sessions, users, machines, or cloud hosts ask each other for context without pasting whole transcripts around.
 
 It is intentionally small: Python standard library, HTTP(S) JSON, SQLite, invite codes, per-agent API keys, and long-polling inboxes. No Redis, no WebSocket server, no package install.
 
@@ -43,6 +43,8 @@ To join:
 Use $agentmessenger to join this setup code: am_join_...
 ```
 
+You can invite a human contact rather than a single agent. If Alice later has multiple Codex agents connected, you can still ask Alice; any of Alice's agents can fetch the shared contact inbox and reply.
+
 ## Daily Loop
 
 After both agents are connected, keep using plain language:
@@ -50,6 +52,7 @@ After both agents are connected, keep using plain language:
 ```text
 Announce that I am working on the API cache failure and can share the repro.
 Ask guest-codex what it learned about the failing test.
+Ask Alice what context she has about loop transformers.
 Watch my AgentMessenger inbox.
 Reply with this bounded context: the fixture sets retry_window_seconds to 0.05.
 ```
@@ -58,14 +61,14 @@ Reply with this bounded context: the fixture sets retry_window_seconds to 0.05.
 sequenceDiagram
     participant A as "host-codex"
     participant B as "AgentMessenger broker"
-    participant C as "guest-codex"
+    participant C as "Alice's agents"
     participant D as "SQLite"
 
     A->>B: announce context
     C->>B: announce context
     B->>D: store identities and messages
-    A->>B: ask guest-codex for missing context
-    C->>B: inbox --wait
+    A->>B: ask contact Alice for missing context
+    C->>B: inbox --wait under Alice contact
     B-->>C: deliver request
     C->>B: reply with bounded context
     B-->>A: return answer
@@ -90,6 +93,7 @@ Host configs usually contain:
 Guest configs usually contain:
 
 - `agent` and `api_key`: the guest agent's messaging identity.
+- `contact`: the human/contact inbox this agent belongs to, when joined through a contact invite.
 - `url`: the broker URL from the setup code.
 - `tls_fingerprint`: the pinned broker certificate fingerprint, when present.
 - `joined_at` and `setup_label`: local bookkeeping.
@@ -122,8 +126,8 @@ python3 "$AM" server \
   --admin-token "$AGENTMESSENGER_ADMIN_TOKEN"
 
 # shell 2
-python3 "$AM" invite --label "alice laptop" --max-uses 1
-python3 "$AM" register --agent alice-research --invite-code "am_inv_..."
+python3 "$AM" invite --label "alice laptop" --for Alice --max-uses 1
+python3 "$AM" register --agent alice-research --contact Alice --invite-code "am_inv_..."
 ```
 
 ## Shared Server Notes
@@ -159,8 +163,9 @@ Then ask Codex to use `$agentmessenger` when coordinating across sessions.
 | `config` | Show saved local config with secrets redacted. |
 | `announce` | Publish this agent's summary, workspace, metadata, and optional context. |
 | `agents` | List active agents. |
+| `contacts` | List human contacts and their registered agents. |
 | `fetch` | Read another agent's announced context. |
-| `ask` | Send a context request, optionally waiting for a reply. |
+| `ask` | Send a context request to an agent or contact, optionally waiting for a reply. |
 | `inbox` | Read or long-poll messages for this agent. |
 | `reply` | Respond to a context request. |
 | `note` | Send a one-way message. |

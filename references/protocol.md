@@ -1,6 +1,6 @@
 # AgentMessenger Protocol
 
-AgentMessenger is intentionally small: one broker, named agents, invite-based registration, per-agent API keys, TTL-based announcements, SQLite persistence, and message inboxes.
+AgentMessenger is intentionally small: one broker, named agents, human contacts, invite-based registration, per-agent API keys, TTL-based announcements, SQLite persistence, and message inboxes.
 
 ## Transport Choice
 
@@ -22,9 +22,9 @@ There are three practical modes:
 
 Registered API keys are stored as SHA-256 hashes. Invite codes and API keys are bearer secrets and are only shown in plaintext when created.
 
-When an API key is used, the broker enforces that the credential can only announce, send, and read inbox messages as its registered `agent` identity. Admin credentials can act as any agent for maintenance and backward compatibility.
+When an API key is used, the broker enforces that the credential can only announce, send, and read inbox messages as its registered `agent` identity. If that identity belongs to a `contact`, reading the agent inbox also includes messages addressed to that contact. Admin credentials can act as any agent for maintenance and backward compatibility.
 
-The CLI `host` and `join` commands wrap this protocol for easy setup. A setup code starts with `am_join_` and contains a broker URL plus a one-use `am_inv_...` invite code. It does not contain an API key; the joining agent receives its API key only after calling `POST /register`.
+The CLI `host` and `join` commands wrap this protocol for easy setup. A setup code starts with `am_join_` and contains a broker URL plus a one-use `am_inv_...` invite code. It can also contain a `contact`, such as `Alice`. It does not contain an API key; the joining agent receives its API key only after calling `POST /register`.
 
 For `host --secure`, the setup code also contains `tls_fingerprint`, the broker certificate's SHA-256 fingerprint. The joining client uses that fingerprint as a certificate pin. This allows secure public-IP setup without requiring DNS or a public CA certificate.
 
@@ -40,6 +40,10 @@ Return broker status.
 
 Return active agents. Expired agents are omitted.
 
+### `GET /contacts`
+
+Return human contacts and their registered agents. A contact can have many agent identities, and each agent can fetch the contact-level inbox.
+
 ### `POST /invites`
 
 Create an invite. Requires admin.
@@ -47,6 +51,7 @@ Create an invite. Requires admin.
 Request fields:
 
 - `label`: optional human label.
+- `contact`: optional human/contact name the invite should attach joining agents to.
 - `max_uses`: optional use count, default 1.
 - `ttl_seconds`: optional lifetime, default 604800.
 
@@ -65,6 +70,7 @@ Request fields:
 - `agent`: stable agent identity.
 - `invite_code`: invite code.
 - `display_name`: optional human label.
+- `contact`: optional human/contact name. If omitted, the invite's contact is used.
 
 The response includes `api_key` once.
 
@@ -96,6 +102,7 @@ Request fields:
 
 - `sender`: source agent name.
 - `recipient`: target agent name or `*`.
+- `recipient_kind`: optional `auto`, `agent`, `contact`, or `broadcast`. `auto` preserves old agent-addressing behavior when the recipient is an exact agent name, otherwise it routes to a known contact if one exists.
 - `kind`: `context_request`, `context_response`, or `note`.
 - `text`: question, answer, or note text.
 - `context`: optional detailed context.
@@ -105,7 +112,7 @@ Request fields:
 
 ### `GET /messages?agent=<agent>&wait=<seconds>&consume=1`
 
-Read messages addressed to `agent` or `*`. `wait` enables long polling. When `consume=1`, returned messages are marked consumed for that agent.
+Read messages addressed to `agent`, `*`, or the registered contact for `agent`. `wait` enables long polling. When `consume=1`, returned messages are marked consumed for that concrete agent, so multiple agents under the same contact can each fetch a contact-level message.
 
 ## Message Shape
 
@@ -114,7 +121,8 @@ Read messages addressed to `agent` or `*`. `wait` enables long polling. When `co
   "id": "m000001",
   "seq": 1,
   "sender": "alice-repo",
-  "recipient": "bob-repo",
+  "recipient_kind": "contact",
+  "recipient": "Bob",
   "kind": "context_request",
   "text": "What have you learned about the failing test?",
   "context": "Optional supporting context.",
@@ -132,10 +140,10 @@ The server defaults to `~/.agentmessenger/broker.sqlite3`, or `AGENTMESSENGER_DB
 Tables:
 
 - `invites`: hashed invite codes, labels, use counts, and expiry.
-- `identities`: registered agent names and hashed API keys.
+- `identities`: registered agent names, optional contacts, and hashed API keys.
 - `agents`: one active row per announced agent.
-- `messages`: all unexpired messages, ordered by `seq`.
-- `message_consumed`: per-agent consumption markers, so broadcast messages can be consumed independently by each recipient.
+- `messages`: all unexpired messages, ordered by `seq`, with `recipient_kind` for agent, contact, or broadcast routing.
+- `message_consumed`: per-agent consumption markers, so contact and broadcast messages can be consumed independently by each concrete recipient agent.
 
 Expired agents and messages are removed opportunistically on each broker operation.
 
@@ -157,12 +165,12 @@ python3 scripts/agentmessenger.py host \
   --agent host-agent
 ```
 
-Share only invite codes with users. Do not share the admin token with normal agents.
+Share only invite codes with users. Do not share the admin token with normal agents. Use `--for Alice` when creating a setup code for a human contact.
 
 For one-code setup, prefer:
 
 ```bash
-python3 scripts/agentmessenger.py host --agent host-agent
+python3 scripts/agentmessenger.py host --for Alice --agent host-agent
 python3 scripts/agentmessenger.py join "am_join_..." --agent joining-agent
 ```
 

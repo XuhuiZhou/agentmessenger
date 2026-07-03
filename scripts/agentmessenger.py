@@ -38,7 +38,7 @@ DEFAULT_TTL = 3600
 DEFAULT_INVITE_TTL = 7 * 24 * 3600
 MAX_WAIT_SECONDS = 120
 JOIN_CODE_PREFIX = "am_join_"
-VERSION = "0.5.0"
+VERSION = "0.6.0"
 
 
 class BrokerError(Exception):
@@ -55,6 +55,14 @@ def clean_agent_name(value: str) -> str:
     value = value.strip() or "agent"
     value = re.sub(r"[^A-Za-z0-9_.-]+", "-", value)
     return value.strip("-") or "agent"
+
+
+def clean_contact_name(value: str) -> str:
+    value = value.strip()
+    if not value:
+        return ""
+    value = re.sub(r"[^A-Za-z0-9_.-]+", "-", value)
+    return value.strip("-")
 
 
 def clean_recipient(value: str) -> str:
@@ -314,6 +322,7 @@ class BrokerState:
                     seq INTEGER PRIMARY KEY,
                     id TEXT UNIQUE NOT NULL,
                     sender TEXT NOT NULL,
+                    recipient_kind TEXT NOT NULL DEFAULT 'agent',
                     recipient TEXT NOT NULL,
                     kind TEXT NOT NULL,
                     text TEXT NOT NULL DEFAULT '',
@@ -336,6 +345,7 @@ class BrokerState:
                     id INTEGER PRIMARY KEY AUTOINCREMENT,
                     code_hash TEXT UNIQUE NOT NULL,
                     label TEXT NOT NULL DEFAULT '',
+                    contact TEXT NOT NULL DEFAULT '',
                     max_uses INTEGER NOT NULL DEFAULT 1,
                     uses INTEGER NOT NULL DEFAULT 0,
                     created_at REAL NOT NULL,
@@ -346,6 +356,7 @@ class BrokerState:
                 CREATE TABLE IF NOT EXISTS identities (
                     agent TEXT PRIMARY KEY,
                     display_name TEXT NOT NULL DEFAULT '',
+                    contact TEXT NOT NULL DEFAULT '',
                     api_key_hash TEXT UNIQUE NOT NULL,
                     invite_id INTEGER,
                     created_at REAL NOT NULL,
@@ -361,6 +372,26 @@ class BrokerState:
                     ON identities(api_key_hash);
                 """
             )
+            self.ensure_column("messages", "recipient_kind", "TEXT NOT NULL DEFAULT 'agent'")
+            self.ensure_column("invites", "contact", "TEXT NOT NULL DEFAULT ''")
+            self.ensure_column("identities", "contact", "TEXT NOT NULL DEFAULT ''")
+            self.conn.execute(
+                "UPDATE messages SET recipient_kind = 'broadcast' "
+                "WHERE recipient = '*' AND recipient_kind = 'agent'"
+            )
+            self.conn.execute(
+                "CREATE INDEX IF NOT EXISTS idx_messages_recipient_kind_seq "
+                "ON messages(recipient_kind, recipient, seq)"
+            )
+            self.conn.execute(
+                "CREATE INDEX IF NOT EXISTS idx_identities_contact "
+                "ON identities(contact)"
+            )
+
+    def ensure_column(self, table: str, column: str, declaration: str) -> None:
+        columns = {row["name"] for row in self.conn.execute(f"PRAGMA table_info({table})")}
+        if column not in columns:
+            self.conn.execute(f"ALTER TABLE {table} ADD COLUMN {column} {declaration}")
 
     def close(self) -> None:
         with self.lock:
@@ -381,19 +412,20 @@ class BrokerState:
             row = self.conn.execute("SELECT 1 FROM identities LIMIT 1").fetchone()
             return row is not None
 
-    def create_invite(self, label: str, max_uses: int, ttl_seconds: int) -> dict[str, Any]:
+    def create_invite(self, label: str, max_uses: int, ttl_seconds: int, contact: str = "") -> dict[str, Any]:
         if max_uses < 1:
             raise BrokerError("max_uses must be at least 1")
         code = generate_invite_code()
         timestamp = now()
+        contact_name = clean_contact_name(contact)
         with self.lock:
             cursor = self.conn.execute(
                 """
                 INSERT INTO invites
-                    (code_hash, label, max_uses, uses, created_at, expires_at)
-                VALUES (?, ?, ?, 0, ?, ?)
+                    (code_hash, label, contact, max_uses, uses, created_at, expires_at)
+                VALUES (?, ?, ?, ?, 0, ?, ?)
                 """,
-                (hash_secret(code), label, max_uses, timestamp, timestamp + ttl_seconds),
+                (hash_secret(code), label, contact_name, max_uses, timestamp, timestamp + ttl_seconds),
             )
             row = self.conn.execute("SELECT * FROM invites WHERE id = ?", (cursor.lastrowid,)).fetchone()
             invite = invite_from_row(row)
@@ -405,7 +437,13 @@ class BrokerState:
             rows = self.conn.execute("SELECT * FROM invites ORDER BY id DESC").fetchall()
             return [invite_from_row(row) for row in rows]
 
-    def register_identity(self, agent_name: str, invite_code: str, display_name: str) -> dict[str, Any]:
+    def register_identity(
+        self,
+        agent_name: str,
+        invite_code: str,
+        display_name: str,
+        contact: str = "",
+    ) -> dict[str, Any]:
         agent_name = clean_agent_name(agent_name)
         timestamp = now()
         api_key = generate_api_key()
@@ -426,15 +464,17 @@ class BrokerState:
             existing = self.conn.execute("SELECT agent FROM identities WHERE agent = ?", (agent_name,)).fetchone()
             if existing is not None:
                 raise BrokerError("agent identity already exists", HTTPStatus.CONFLICT)
+            contact_name = clean_contact_name(contact) or str(invite_data.get("contact") or "")
             self.conn.execute(
                 """
                 INSERT INTO identities
-                    (agent, display_name, api_key_hash, invite_id, created_at, last_seen_at)
-                VALUES (?, ?, ?, ?, ?, ?)
+                    (agent, display_name, contact, api_key_hash, invite_id, created_at, last_seen_at)
+                VALUES (?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     agent_name,
                     display_name,
+                    contact_name,
                     hash_secret(api_key),
                     invite_data["id"],
                     timestamp,
@@ -474,6 +514,73 @@ class BrokerState:
             rows = self.conn.execute("SELECT * FROM identities ORDER BY agent").fetchall()
             return [identity_from_row(row) for row in rows]
 
+    def has_agent_identity(self, agent_name: str) -> bool:
+        row = self.conn.execute("SELECT 1 FROM identities WHERE agent = ?", (agent_name,)).fetchone()
+        return row is not None
+
+    def has_contact(self, contact: str) -> bool:
+        row = self.conn.execute("SELECT 1 FROM identities WHERE contact = ?", (contact,)).fetchone()
+        return row is not None
+
+    def contact_for_agent(self, agent_name: str) -> str:
+        row = self.conn.execute("SELECT contact FROM identities WHERE agent = ?", (agent_name,)).fetchone()
+        return str(row["contact"] or "") if row else ""
+
+    def list_contacts(self) -> list[dict[str, Any]]:
+        with self.lock:
+            self.cleanup()
+            rows = self.conn.execute(
+                """
+                SELECT
+                    identities.agent,
+                    identities.display_name,
+                    identities.contact,
+                    identities.created_at,
+                    identities.last_seen_at,
+                    agents.summary,
+                    agents.workspace,
+                    agents.updated_at AS announced_at,
+                    agents.expires_at AS announcement_expires_at
+                FROM identities
+                LEFT JOIN agents ON agents.name = identities.agent
+                WHERE identities.contact != ''
+                ORDER BY identities.contact, identities.agent
+                """
+            ).fetchall()
+            contacts: dict[str, dict[str, Any]] = {}
+            for row in rows:
+                contact = row["contact"]
+                entry = contacts.setdefault(contact, {"contact": contact, "agents": []})
+                entry["agents"].append(
+                    {
+                        "agent": row["agent"],
+                        "display_name": row["display_name"],
+                        "created_at": row["created_at"],
+                        "last_seen_at": row["last_seen_at"],
+                        "active": row["announcement_expires_at"] is not None,
+                        "summary": row["summary"] or "",
+                        "workspace": row["workspace"] or "",
+                        "announced_at": row["announced_at"],
+                        "announcement_expires_at": row["announcement_expires_at"],
+                    }
+                )
+            pending = self.conn.execute(
+                """
+                SELECT contact, COUNT(*) AS count
+                FROM invites
+                WHERE contact != ''
+                  AND revoked_at IS NULL
+                  AND expires_at > ?
+                  AND uses < max_uses
+                GROUP BY contact
+                """,
+                (now(),),
+            ).fetchall()
+            for row in pending:
+                entry = contacts.setdefault(row["contact"], {"contact": row["contact"], "agents": []})
+                entry["pending_invites"] = row["count"]
+            return list(contacts.values())
+
     def announce(self, agent_name: str, payload: dict[str, Any]) -> dict[str, Any]:
         with self.condition:
             self.cleanup()
@@ -510,7 +617,14 @@ class BrokerState:
     def list_agents(self) -> list[dict[str, Any]]:
         with self.lock:
             self.cleanup()
-            rows = self.conn.execute("SELECT * FROM agents ORDER BY name").fetchall()
+            rows = self.conn.execute(
+                """
+                SELECT agents.*, identities.contact AS contact
+                FROM agents
+                LEFT JOIN identities ON identities.agent = agents.name
+                ORDER BY agents.name
+                """
+            ).fetchall()
             return [agent_from_row(row) for row in rows]
 
     def fetch_agent(self, agent_name: str) -> dict[str, Any] | None:
@@ -531,18 +645,23 @@ class BrokerState:
             message_id = f"m{seq:06d}"
             thread_id = str(payload.get("thread_id") or payload.get("in_reply_to") or message_id)
             timestamp = now()
+            recipient, recipient_kind = self.resolve_recipient(
+                str(payload.get("recipient") or "*"),
+                str(payload.get("recipient_kind") or "auto"),
+            )
             self.conn.execute(
                 """
                 INSERT INTO messages
-                    (seq, id, sender, recipient, kind, text, context, in_reply_to,
+                    (seq, id, sender, recipient_kind, recipient, kind, text, context, in_reply_to,
                      thread_id, created_at, expires_at)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     seq,
                     message_id,
                     clean_agent_name(str(payload.get("sender") or "unknown")),
-                    clean_recipient(str(payload.get("recipient") or "*")),
+                    recipient_kind,
+                    recipient,
                     str(payload.get("kind") or "note"),
                     str(payload.get("text") or ""),
                     str(payload.get("context") or ""),
@@ -555,6 +674,25 @@ class BrokerState:
             message = self.fetch_message(message_id)
             self.condition.notify_all()
             return message or {}
+
+    def resolve_recipient(self, recipient: str, recipient_kind: str) -> tuple[str, str]:
+        requested = (recipient_kind or "auto").strip().lower()
+        if recipient.strip() == "*" or requested == "broadcast":
+            return "*", "broadcast"
+        if requested == "contact":
+            contact = clean_contact_name(recipient)
+            if not contact:
+                raise BrokerError("contact recipient is required")
+            return contact, "contact"
+        if requested == "agent":
+            return clean_agent_name(recipient), "agent"
+        cleaned = clean_recipient(recipient)
+        if self.has_agent_identity(cleaned):
+            return cleaned, "agent"
+        contact = clean_contact_name(recipient)
+        if contact and self.has_contact(contact):
+            return contact, "contact"
+        return cleaned, "agent"
 
     def fetch_message(self, message_id: str) -> dict[str, Any] | None:
         row = self.conn.execute("SELECT * FROM messages WHERE id = ?", (message_id,)).fetchone()
@@ -600,11 +738,20 @@ class BrokerState:
         include_consumed: bool,
         in_reply_to: str | None,
     ) -> list[dict[str, Any]]:
+        contact = self.contact_for_agent(agent_name)
         conditions = [
             "messages.seq > ?",
-            "(messages.recipient = ? OR messages.recipient = '*')",
+        ]
+        recipient_conditions = [
+            "(messages.recipient_kind = 'agent' AND messages.recipient = ?)",
+            "messages.recipient = '*'",
+            "messages.recipient_kind = 'broadcast'",
         ]
         params: list[Any] = [since, agent_name]
+        if contact:
+            recipient_conditions.append("(messages.recipient_kind = 'contact' AND messages.recipient = ?)")
+            params.append(contact)
+        conditions.append(f"({' OR '.join(recipient_conditions)})")
         if not include_consumed:
             conditions.append(
                 "NOT EXISTS ("
@@ -624,6 +771,7 @@ class BrokerState:
 def agent_from_row(row: sqlite3.Row) -> dict[str, Any]:
     return {
         "name": row["name"],
+        "contact": row_value(row, "contact", ""),
         "summary": row["summary"],
         "workspace": row["workspace"],
         "context": row["context"],
@@ -638,6 +786,7 @@ def message_from_row(row: sqlite3.Row) -> dict[str, Any]:
         "id": row["id"],
         "seq": row["seq"],
         "sender": row["sender"],
+        "recipient_kind": row_value(row, "recipient_kind", "agent"),
         "recipient": row["recipient"],
         "kind": row["kind"],
         "text": row["text"],
@@ -653,6 +802,7 @@ def invite_from_row(row: sqlite3.Row) -> dict[str, Any]:
     return {
         "id": row["id"],
         "label": row["label"],
+        "contact": row_value(row, "contact", ""),
         "max_uses": row["max_uses"],
         "uses": row["uses"],
         "remaining_uses": max(0, row["max_uses"] - row["uses"]),
@@ -666,10 +816,15 @@ def identity_from_row(row: sqlite3.Row, last_seen_at: float | None = None) -> di
     return {
         "agent": row["agent"],
         "display_name": row["display_name"],
+        "contact": row_value(row, "contact", ""),
         "invite_id": row["invite_id"],
         "created_at": row["created_at"],
         "last_seen_at": row["last_seen_at"] if last_seen_at is None else last_seen_at,
     }
+
+
+def row_value(row: sqlite3.Row, key: str, default: Any = None) -> Any:
+    return row[key] if key in row.keys() else default
 
 
 class BrokerHandler(BaseHTTPRequestHandler):
@@ -719,6 +874,8 @@ class BrokerHandler(BaseHTTPRequestHandler):
                     return
                 if path == "/agents":
                     self.write_json({"agents": self.broker.list_agents()})
+                elif path == "/contacts":
+                    self.write_json({"contacts": self.broker.list_contacts()})
                 elif path.startswith("/agents/") and path.endswith("/context"):
                     agent_name = urllib.parse.unquote(path.split("/")[2])
                     agent = self.broker.fetch_agent(agent_name)
@@ -767,20 +924,22 @@ class BrokerHandler(BaseHTTPRequestHandler):
                 agent_name = clean_agent_name(str(body.get("agent") or ""))
                 invite_code = str(body.get("invite_code") or "")
                 display_name = str(body.get("display_name") or agent_name)
+                contact = str(body.get("contact") or "")
                 if not agent_name:
                     raise BrokerError("agent is required")
                 if not invite_code:
                     raise BrokerError("invite_code is required")
-                identity = self.broker.register_identity(agent_name, invite_code, display_name)
+                identity = self.broker.register_identity(agent_name, invite_code, display_name, contact)
                 self.write_json({"identity": identity})
                 return
             if path == "/invites":
                 if self.require_admin() is None:
                     return
                 label = str(body.get("label") or "")
+                contact = str(body.get("contact") or "")
                 max_uses = int(body.get("max_uses") or 1)
                 ttl_seconds = int(body.get("ttl_seconds") or DEFAULT_INVITE_TTL)
-                invite = self.broker.create_invite(label, max_uses, ttl_seconds)
+                invite = self.broker.create_invite(label, max_uses, ttl_seconds, contact)
                 self.write_json({"invite": invite})
                 return
 
@@ -1013,6 +1172,7 @@ def cmd_status(args: argparse.Namespace) -> int:
 def cmd_invite(args: argparse.Namespace) -> int:
     payload = {
         "label": args.label or "",
+        "contact": clean_contact_name(args.contact or ""),
         "max_uses": args.max_uses,
         "ttl_seconds": args.ttl,
     }
@@ -1024,6 +1184,8 @@ def cmd_invite(args: argparse.Namespace) -> int:
         print(f"Created invite {invite['id']} ({invite['remaining_uses']} use(s) remaining).")
         if invite.get("label"):
             print(f"label: {invite['label']}")
+        if invite.get("contact"):
+            print(f"contact: {invite['contact']}")
         print(f"invite code: {invite['code']}")
     return 0
 
@@ -1042,7 +1204,7 @@ def cmd_invites(args: argparse.Namespace) -> int:
             status = "revoked" if invite["revoked_at"] else "active"
             print(
                 f"{invite['id']} {status} uses={invite['uses']}/{invite['max_uses']} "
-                f"expires={expires} label={invite['label']}"
+                f"expires={expires} label={invite['label']} contact={invite.get('contact', '')}"
             )
     return 0
 
@@ -1053,6 +1215,7 @@ def cmd_register(args: argparse.Namespace) -> int:
         "agent": agent,
         "invite_code": args.invite_code,
         "display_name": args.display_name or agent,
+        "contact": clean_contact_name(args.contact or ""),
     }
     result = make_client(args).request("POST", "/register", payload)
     if args.json:
@@ -1060,6 +1223,8 @@ def cmd_register(args: argparse.Namespace) -> int:
     else:
         identity = result["identity"]
         print(f"Registered {identity['agent']}.")
+        if identity.get("contact"):
+            print(f"contact: {identity['contact']}")
         print("API key (shown once):")
         print(identity["api_key"])
         print("\nSet these in this agent session:")
@@ -1138,17 +1303,24 @@ def start_background_server(
     return int(proc.pid)
 
 
-def register_with_invite(client: Client, agent: str, invite_code: str, display_name: str | None = None) -> dict[str, Any]:
+def register_with_invite(
+    client: Client,
+    agent: str,
+    invite_code: str,
+    display_name: str | None = None,
+    contact: str = "",
+) -> dict[str, Any]:
     payload = {
         "agent": agent,
         "invite_code": invite_code,
         "display_name": display_name or agent,
+        "contact": clean_contact_name(contact),
     }
     return client.request("POST", "/register", payload)["identity"]
 
 
-def create_invite(client: Client, label: str, max_uses: int, ttl: int) -> dict[str, Any]:
-    payload = {"label": label, "max_uses": max_uses, "ttl_seconds": ttl}
+def create_invite(client: Client, label: str, max_uses: int, ttl: int, contact: str = "") -> dict[str, Any]:
+    payload = {"label": label, "max_uses": max_uses, "ttl_seconds": ttl, "contact": clean_contact_name(contact)}
     return client.request("POST", "/invites", payload)["invite"]
 
 
@@ -1199,6 +1371,8 @@ def cmd_host(args: argparse.Namespace) -> int:
 
     admin_client = Client(local_url, token=admin_token, tls_fingerprint=tls_fingerprint)
     agent = clean_agent_name(args.agent or str(config.get("agent") or "") or default_agent_name())
+    host_contact = clean_contact_name(args.contact or str(config.get("contact") or ""))
+    invite_contact = clean_contact_name(args.for_contact or "")
     api_key = str(config.get("api_key") or "") if config.get("agent") == agent else ""
     try:
         if not api_key:
@@ -1208,11 +1382,13 @@ def cmd_host(args: argparse.Namespace) -> int:
                 agent,
                 self_invite["code"],
                 args.display_name or agent,
+                host_contact,
             )
             api_key = identity["api_key"]
+            host_contact = str(identity.get("contact") or host_contact)
 
-        invite_label = args.label or f"join:{agent}"
-        invite = create_invite(admin_client, invite_label, args.max_uses, args.ttl)
+        invite_label = args.label or (f"join:{invite_contact}" if invite_contact else f"join:{agent}")
+        invite = create_invite(admin_client, invite_label, args.max_uses, args.ttl, invite_contact)
     except SystemExit as exc:
         raise SystemExit(
             "Could not create an invite. If this broker was already running, rerun with "
@@ -1226,6 +1402,8 @@ def cmd_host(args: argparse.Namespace) -> int:
         "invite_code": invite["code"],
         "label": invite_label,
     }
+    if invite_contact:
+        join_payload["contact"] = invite_contact
     if args.note:
         join_payload["note"] = args.note
     if tls_fingerprint:
@@ -1237,6 +1415,7 @@ def cmd_host(args: argparse.Namespace) -> int:
         "url": local_url,
         "agent": agent,
         "api_key": api_key,
+        "contact": host_contact,
         "admin_token": admin_token,
         "db": db_path,
         "server_log": log_path,
@@ -1261,6 +1440,8 @@ def cmd_host(args: argparse.Namespace) -> int:
         "server_pid": server_pid,
         "server_log": log_path,
         "tls_fingerprint": tls_fingerprint,
+        "contact": host_contact,
+        "invite_contact": invite_contact,
     }
     if args.json:
         emit(args, result)
@@ -1270,6 +1451,8 @@ def cmd_host(args: argparse.Namespace) -> int:
         print(f"broker url: {local_url}")
         if tls_fingerprint:
             print(f"tls fingerprint: {tls_fingerprint}")
+        if invite_contact:
+            print(f"setup code contact: {invite_contact}")
         elif urllib.parse.urlparse(public_url).scheme == "http" and args.host not in {"127.0.0.1", "localhost", "::1"}:
             print("warning: public HTTP is not encrypted; prefer --secure for real conversations")
         if server_pid:
@@ -1298,17 +1481,20 @@ def cmd_join(args: argparse.Namespace) -> int:
         or str(config.get("tls_fingerprint") or "")
     )
     agent = configured_agent(args)
+    contact = clean_contact_name(args.contact or str(payload.get("contact") or config.get("contact") or ""))
     identity = register_with_invite(
         Client(url, tls_fingerprint=tls_fingerprint),
         agent,
         invite_code,
         args.display_name or agent,
+        contact,
     )
     saved = {
         **config,
         "url": url,
         "agent": identity["agent"],
         "api_key": identity["api_key"],
+        "contact": identity.get("contact", ""),
         "joined_at": now(),
         "setup_label": payload.get("label", ""),
     }
@@ -1323,12 +1509,15 @@ def cmd_join(args: argparse.Namespace) -> int:
         "config_path": str(config_path),
         "url": url,
         "credential": "saved",
+        "contact": identity.get("contact", ""),
         "tls_fingerprint": tls_fingerprint,
     }
     if args.json:
         emit(args, result)
     else:
         print(f"Joined AgentMessenger as {identity['agent']}.")
+        if identity.get("contact"):
+            print(f"Joined contact inbox: {identity['contact']}.")
         print(f"config: {config_path}")
         print("Saved broker URL and API key. Future commands can use the saved config automatically.")
         if tls_fingerprint:
@@ -1362,6 +1551,8 @@ def cmd_whoami(args: argparse.Namespace) -> int:
         credential = result["credential"]
         if credential["kind"] == "identity":
             print(f"Authenticated as identity {credential['agent']}.")
+            if credential.get("contact"):
+                print(f"Contact inbox: {credential['contact']}.")
         else:
             print(f"Authenticated as {credential['kind']}.")
     return 0
@@ -1393,10 +1584,39 @@ def cmd_agents(args: argparse.Namespace) -> int:
     for agent in agents:
         updated = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(agent["updated_at"]))
         print(f"{agent['name']}  updated={updated}")
+        if agent.get("contact"):
+            print(f"  contact: {agent['contact']}")
         if agent.get("workspace"):
             print(f"  workspace: {agent['workspace']}")
         if agent.get("summary"):
             print(f"  summary: {agent['summary']}")
+    return 0
+
+
+def cmd_contacts(args: argparse.Namespace) -> int:
+    result = make_client(args).request("GET", "/contacts")
+    if args.json:
+        emit(args, result)
+        return 0
+    contacts = result.get("contacts", [])
+    if not contacts:
+        print("No contacts.")
+        return 0
+    for contact in contacts:
+        pending = contact.get("pending_invites", 0)
+        suffix = f" pending_invites={pending}" if pending else ""
+        print(f"{contact['contact']}{suffix}")
+        for agent in contact.get("agents", []):
+            status = "active" if agent.get("active") else "inactive"
+            last_seen = agent.get("last_seen_at")
+            last_seen_text = (
+                time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(last_seen))
+                if last_seen
+                else "never"
+            )
+            print(f"  {agent['agent']}  {status}  last_seen={last_seen_text}")
+            if agent.get("summary"):
+                print(f"    summary: {agent['summary']}")
     return 0
 
 
@@ -1420,12 +1640,23 @@ def cmd_fetch(args: argparse.Namespace) -> int:
     return 0
 
 
+def resolve_cli_recipient(args: argparse.Namespace) -> tuple[str, str]:
+    to_contact = clean_contact_name(getattr(args, "to_contact", "") or "")
+    to_agent_or_contact = getattr(args, "to", None)
+    if to_contact:
+        return to_contact, "contact"
+    if to_agent_or_contact:
+        return clean_recipient(to_agent_or_contact), "auto"
+    raise SystemExit("Pass --to <agent-or-contact> or --to-contact <contact>")
+
+
 def cmd_ask(args: argparse.Namespace) -> int:
     sender = configured_agent(args, "from_agent")
-    recipient = clean_recipient(args.to)
+    recipient, recipient_kind = resolve_cli_recipient(args)
     payload = {
         "sender": sender,
         "recipient": recipient,
+        "recipient_kind": recipient_kind,
         "kind": "context_request",
         "text": args.question,
         "context": read_context(args.context, args.context_file),
@@ -1473,10 +1704,11 @@ def cmd_inbox(args: argparse.Namespace) -> int:
 
 def cmd_reply(args: argparse.Namespace) -> int:
     sender = configured_agent(args, "from_agent")
-    recipient = clean_recipient(args.to)
+    recipient, recipient_kind = resolve_cli_recipient(args)
     payload = {
         "sender": sender,
         "recipient": recipient,
+        "recipient_kind": recipient_kind,
         "kind": "context_response",
         "text": args.message,
         "context": read_context(args.context, args.context_file),
@@ -1491,10 +1723,11 @@ def cmd_reply(args: argparse.Namespace) -> int:
 
 def cmd_note(args: argparse.Namespace) -> int:
     sender = configured_agent(args, "from_agent")
-    recipient = clean_recipient(args.to)
+    recipient, recipient_kind = resolve_cli_recipient(args)
     payload = {
         "sender": sender,
         "recipient": recipient,
+        "recipient_kind": recipient_kind,
         "kind": "note",
         "text": args.message,
         "context": read_context(args.context, args.context_file),
@@ -1520,7 +1753,12 @@ def print_messages(messages: list[dict[str, Any]]) -> None:
         return
     for message in messages:
         timestamp = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(message["created_at"]))
-        print(f"{message['id']} {message['kind']} from={message['sender']} to={message['recipient']} at={timestamp}")
+        recipient = message["recipient"]
+        if message.get("recipient_kind") == "contact":
+            recipient = f"contact:{recipient}"
+        elif message.get("recipient_kind") == "broadcast":
+            recipient = "*"
+        print(f"{message['id']} {message['kind']} from={message['sender']} to={recipient} at={timestamp}")
         if message.get("in_reply_to"):
             print(f"  in_reply_to: {message['in_reply_to']}")
         if message.get("text"):
@@ -1580,6 +1818,8 @@ def build_parser() -> argparse.ArgumentParser:
     host.add_argument("--tls-days", type=int, default=365)
     host.add_argument("--agent")
     host.add_argument("--display-name")
+    host.add_argument("--contact", help="human/contact name for the host agent")
+    host.add_argument("--for", dest="for_contact", help="human/contact name for the generated setup code")
     host.add_argument("--label", default="", help="label for the friend invite")
     host.add_argument("--max-uses", type=int, default=1)
     host.add_argument("--ttl", type=int, default=DEFAULT_INVITE_TTL)
@@ -1593,6 +1833,7 @@ def build_parser() -> argparse.ArgumentParser:
     join.add_argument("code", help="am_join setup code or raw am_inv invite code")
     join.add_argument("--agent")
     join.add_argument("--display-name")
+    join.add_argument("--contact", help="override or set the human/contact name for this agent")
     join.set_defaults(func=cmd_join)
 
     config = subparsers.add_parser("config", help="show saved local config")
@@ -1603,6 +1844,7 @@ def build_parser() -> argparse.ArgumentParser:
     invite = subparsers.add_parser("invite", help="create an invite code with the admin token")
     add_client_options(invite)
     invite.add_argument("--label", default="")
+    invite.add_argument("--for", dest="contact", help="human/contact name the invite should join")
     invite.add_argument("--max-uses", type=int, default=1)
     invite.add_argument("--ttl", type=int, default=DEFAULT_INVITE_TTL)
     invite.set_defaults(func=cmd_invite)
@@ -1616,6 +1858,7 @@ def build_parser() -> argparse.ArgumentParser:
     register.add_argument("--agent")
     register.add_argument("--invite-code", required=True)
     register.add_argument("--display-name")
+    register.add_argument("--contact", help="human/contact name this agent belongs to")
     register.set_defaults(func=cmd_register)
 
     whoami = subparsers.add_parser("whoami", help="show the current credential")
@@ -1636,6 +1879,10 @@ def build_parser() -> argparse.ArgumentParser:
     add_client_options(agents)
     agents.set_defaults(func=cmd_agents)
 
+    contacts = subparsers.add_parser("contacts", help="list human contacts and their registered agents")
+    add_client_options(contacts)
+    contacts.set_defaults(func=cmd_contacts)
+
     fetch = subparsers.add_parser("fetch", help="fetch an agent's announced context")
     add_client_options(fetch)
     fetch.add_argument("--agent", required=True)
@@ -1644,7 +1891,8 @@ def build_parser() -> argparse.ArgumentParser:
     ask = subparsers.add_parser("ask", help="ask another agent for context")
     add_client_options(ask)
     ask.add_argument("--from", dest="from_agent")
-    ask.add_argument("--to", required=True)
+    ask.add_argument("--to", help="agent or known contact; exact agent names win")
+    ask.add_argument("--to-contact", help="force delivery to a contact inbox")
     ask.add_argument("--question", required=True)
     ask.add_argument("--wait", action="store_true")
     ask.add_argument("--timeout", type=int, default=60)
@@ -1666,7 +1914,8 @@ def build_parser() -> argparse.ArgumentParser:
     reply = subparsers.add_parser("reply", help="reply to a context request")
     add_client_options(reply)
     reply.add_argument("--from", dest="from_agent")
-    reply.add_argument("--to", required=True)
+    reply.add_argument("--to", help="agent or known contact; exact agent names win")
+    reply.add_argument("--to-contact", help="force delivery to a contact inbox")
     reply.add_argument("--request-id", required=True)
     reply.add_argument("--message", required=True)
     reply.add_argument("--ttl", type=int, default=DEFAULT_TTL)
@@ -1676,7 +1925,8 @@ def build_parser() -> argparse.ArgumentParser:
     note = subparsers.add_parser("note", help="send a one-way note")
     add_client_options(note)
     note.add_argument("--from", dest="from_agent")
-    note.add_argument("--to", required=True)
+    note.add_argument("--to", help="agent or known contact; exact agent names win")
+    note.add_argument("--to-contact", help="force delivery to a contact inbox")
     note.add_argument("--message", required=True)
     note.add_argument("--ttl", type=int, default=DEFAULT_TTL)
     add_context_options(note)

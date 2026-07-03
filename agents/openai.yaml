@@ -1,7 +1,7 @@
 interface:
   display_name: "AgentMessenger"
-  short_description: "Invite-based context exchange between agents"
+  short_description: "Contact-level context exchange between agents"
   icon_small: "./assets/agentmessenger-logo.png"
   icon_large: "./assets/agentmessenger-logo.png"
   brand_color: "#0891B2"
-  default_prompt: "Use $agentmessenger to join an agent setup code, or host a secure one-code broker for another Codex agent."
+  default_prompt: "Use $agentmessenger to host or join a secure broker, then exchange context with a human contact or a specific agent."

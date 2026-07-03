@@ -138,9 +138,8 @@ def stop_server(proc: subprocess.Popen[str]) -> None:
             proc.wait(timeout=5)
 
 
-def register_agent(url: str, admin_token: str, agent: str, invite_code: str) -> str:
-    identity = json_cli(
-        url,
+def register_agent(url: str, admin_token: str, agent: str, invite_code: str, contact: str | None = None) -> str:
+    command = [
         "register",
         "--agent",
         agent,
@@ -148,12 +147,22 @@ def register_agent(url: str, admin_token: str, agent: str, invite_code: str) -> 
         agent,
         "--invite-code",
         invite_code,
+    ]
+    if contact:
+        command.extend(["--contact", contact])
+    identity = json_cli(
+        url,
+        *command,
     )["identity"]
     assert identity["agent"] == agent
+    if contact:
+        assert identity["contact"] == contact
     assert identity["api_key"].startswith("am_key_")
     whoami = json_cli(url, "whoami", api_key=identity["api_key"])["credential"]
     assert whoami["kind"] == "identity"
     assert whoami["agent"] == agent
+    if contact:
+        assert whoami["contact"] == contact
     invites = json_cli(url, "invites", admin_token=admin_token)["invites"]
     assert invites[0]["uses"] >= 1
     return identity["api_key"]
@@ -441,6 +450,73 @@ def main() -> int:
             assert len(replies) == 1
             assert replies[0]["in_reply_to"] == request["id"]
             assert "Settings cache" in replies[0]["text"]
+
+            alice_contact_invite = json_cli(
+                url,
+                "invite",
+                "--label",
+                "alice-contact",
+                "--for",
+                "Alice",
+                "--max-uses",
+                "2",
+                admin_token=admin_token,
+            )["invite"]
+            assert alice_contact_invite["contact"] == "Alice"
+            alice_mac_key = register_agent(url, admin_token, "alice-mac", alice_contact_invite["code"], contact="Alice")
+            alice_aws_key = register_agent(url, admin_token, "alice-aws", alice_contact_invite["code"], contact="Alice")
+
+            contacts = json_cli(url, "contacts", api_key=bob_key)["contacts"]
+            alice_contact = next(contact for contact in contacts if contact["contact"] == "Alice")
+            assert {agent["agent"] for agent in alice_contact["agents"]} == {"alice-mac", "alice-aws"}
+
+            contact_request = json_cli(
+                url,
+                "ask",
+                "--from",
+                "bob",
+                "--to",
+                "Alice",
+                "--question",
+                "What context do Alice's agents have?",
+                api_key=bob_key,
+            )["message"]
+            assert contact_request["recipient"] == "Alice"
+            assert contact_request["recipient_kind"] == "contact"
+
+            mac_inbox = json_cli(url, "inbox", "--agent", "alice-mac", "--peek", api_key=alice_mac_key)["messages"]
+            aws_inbox = json_cli(url, "inbox", "--agent", "alice-aws", "--peek", api_key=alice_aws_key)["messages"]
+            assert contact_request["id"] in {message["id"] for message in mac_inbox}
+            assert contact_request["id"] in {message["id"] for message in aws_inbox}
+
+            json_cli(
+                url,
+                "reply",
+                "--from",
+                "alice-aws",
+                "--to",
+                "bob",
+                "--request-id",
+                contact_request["id"],
+                "--message",
+                "Alice's AWS agent can answer this one.",
+                api_key=alice_aws_key,
+            )
+            bob_contact_reply = json_cli(
+                url,
+                "inbox",
+                "--agent",
+                "bob",
+                "--include-consumed",
+                "--peek",
+                api_key=bob_key,
+            )["messages"]
+            assert any(
+                message["in_reply_to"] == contact_request["id"]
+                and message["sender"] == "alice-aws"
+                and "AWS agent" in message["text"]
+                for message in bob_contact_reply
+            )
         finally:
             stop_server(proc)
 

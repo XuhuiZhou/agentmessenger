@@ -7,9 +7,11 @@ description: Start and use a lightweight local or shared broker for Codex-to-Cod
 
 Use this skill when agents need to exchange context without copying large chat logs by hand. Prefer short summaries and targeted requests; send raw files or sensitive state only when the user clearly wants that.
 
+Treat people as contacts and sessions as agents. If the user says "ask Alice", prefer sending to Alice's contact inbox rather than guessing one of Alice's concrete agent names. Use specific agent names only when the user names one or when contact routing is unavailable.
+
 When the user asks this agent to host, first decide whether the hosting target is clear. If not, ask only the missing practical questions: where should the broker live (`local`, `SSH/shared host`, or `AWS/public VM`), what access or target should be used, and who the setup code is for. Do not ask the user to paste raw secrets; use available SSH/AWS/tool access or ask them to grant access in the environment. Reuse a healthy saved config before starting a new broker.
 
-When the user provides an `am_join_...` setup code, treat it as an instruction to connect this agent. Do the setup yourself: run `join`, verify with `whoami`, announce the current context if useful, then offer to watch `inbox --wait`. Do not ask the user to export environment variables unless the automatic config path fails.
+When the user provides an `am_join_...` setup code, treat it as an instruction to connect this agent. Do the setup yourself: run `join`, verify with `whoami`, announce the current context if useful, then offer to watch `inbox --wait`. If the setup code names a contact, this agent joins that contact's shared inbox. Do not ask the user to export environment variables unless the automatic config path fails.
 
 ## Quick Start
 
@@ -37,6 +39,14 @@ python3 "$AM" host --agent "$(whoami)-$(basename "$PWD")"
 ```
 
 This starts or reuses a broker, registers the host agent, saves `~/.agentmessenger/config.json`, and prints an `am_join_...` setup code. Send only that setup code to the other user or agent.
+
+When inviting a person, attach the setup code to a contact:
+
+```bash
+python3 "$AM" host --for Alice --agent "$(whoami)-$(basename "$PWD")"
+```
+
+Alice can join multiple agents under the same contact. Later, send messages to `Alice`; every Alice agent can fetch the shared contact inbox, and the reply still records the concrete responding agent.
 
 For public hosts or AWS, use pinned HTTPS:
 
@@ -83,13 +93,14 @@ Find peers:
 
 ```bash
 python3 "$AM" agents
+python3 "$AM" contacts
 ```
 
 Ask another agent for context and wait for a reply:
 
 ```bash
 python3 "$AM" ask \
-  --to other-agent \
+  --to Alice \
   --question "What have you learned about the failing test?" \
   --wait
 ```
@@ -113,12 +124,12 @@ python3 "$AM" reply \
 ## Workflow
 
 1. If the user is hosting, inspect saved config with `config` or `status`. If the target is unclear, ask where to host and what access is available.
-2. Run `host --agent <name>` for local/private hosting, or `host --secure --host 0.0.0.0 --public-url https://... --agent <name>` for public/AWS hosting. Give the printed `am_join_...` setup code to the other user.
+2. Run `host --for <Contact> --agent <name>` for local/private hosting, or `host --for <Contact> --secure --host 0.0.0.0 --public-url https://... --agent <name>` for public/AWS hosting. Give the printed `am_join_...` setup code to the other user.
 3. If the user received a setup code, run `join "am_join_..." --agent <name>`.
 4. Use `status` or `whoami` to verify the saved config works.
 5. Run `announce` with a concise summary and optional context file.
-6. Use `agents` or `fetch --agent <name>` to discover available context.
-7. Use `ask --to <agent> --question ... --wait` for targeted context requests.
+6. Use `contacts`, `agents`, or `fetch --agent <name>` to discover available context.
+7. Use `ask --to <Contact> --question ... --wait` for human/contact-level requests. Use `--to-contact <Contact>` to force contact routing if a contact and agent share a name.
 8. In the receiving session, run `inbox --wait`, inspect the request, and respond with `reply`.
 
 ## Safety Rules
@@ -146,8 +157,9 @@ Use `scripts/agentmessenger.py` for all operations. It supports:
 - `whoami`: show the current credential.
 - `announce`: publish this session's summary and optional context.
 - `agents`: list active agents.
+- `contacts`: list human contacts and their registered agents.
 - `fetch`: read another agent's announced context.
-- `ask`: send a context request.
+- `ask`: send a context request to an agent or contact.
 - `inbox`: read or wait for incoming messages.
 - `reply`: respond to a request.
 - `note`: send a one-way note.
