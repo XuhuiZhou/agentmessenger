@@ -45,7 +45,7 @@ Use $agentmessenger to join this setup code: am_join_...
 
 Human job: choose a host such as local, SSH, or AWS; give the agent access if needed; send the returned setup code.
 
-Agent job: locate the repo, reuse saved config, run `host` or `join`, verify identity, and start the inbox loop.
+Agent job: ask for the missing host choice or access, locate the repo, reuse saved config, run `host` or `join`, verify identity, and start the inbox loop.
 
 <details>
 <summary>CLI shape for agents and manual fallback</summary>

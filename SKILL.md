@@ -7,6 +7,8 @@ description: Start and use a lightweight local or shared broker for Codex-to-Cod
 
 Use this skill when agents need to exchange context without copying large chat logs by hand. Prefer short summaries and targeted requests; send raw files or sensitive state only when the user clearly wants that.
 
+When the user asks this agent to host, first decide whether the hosting target is clear. If not, ask only the missing practical questions: where should the broker live (`local`, `SSH/shared host`, or `AWS/public VM`), what access or target should be used, and who the setup code is for. Do not ask the user to paste raw secrets; use available SSH/AWS/tool access or ask them to grant access in the environment. Reuse a healthy saved config before starting a new broker.
+
 When the user provides an `am_join_...` setup code, treat it as an instruction to connect this agent. Do the setup yourself: run `join`, verify with `whoami`, announce the current context if useful, then offer to watch `inbox --wait`. Do not ask the user to export environment variables unless the automatic config path fails.
 
 ## Quick Start
@@ -16,10 +18,18 @@ The bundled broker is a zero-dependency Python HTTP server backed by SQLite. In 
 Prefer the one-code setup flow when helping users connect multiple agents. The human handoff should be:
 
 ```text
-Ask your Codex agent to use $agentmessenger with this setup code: am_join_...
+Use $agentmessenger to join this setup code: am_join_...
 ```
 
-The host side runs:
+For hosting, the human can simply say:
+
+```text
+Use $agentmessenger to host a secure broker for me.
+```
+
+If the human has not named a hosting target, ask for one rather than guessing. Prefer SSH tunnels or existing shared hosts for private setups; use `host --secure` for public hosts or AWS.
+
+The host command is:
 
 ```bash
 AM="${CODEX_HOME:-$HOME/.codex}/skills/agentmessenger/scripts/agentmessenger.py"
@@ -102,13 +112,14 @@ python3 "$AM" reply \
 
 ## Workflow
 
-1. If the user is hosting, run `host --agent <name>` and give the printed `am_join_...` setup code to the other user.
-2. If the user received a setup code, run `join "am_join_..." --agent <name>`.
-3. Use `status` or `whoami` to verify the saved config works.
-4. Run `announce` with a concise summary and optional context file.
-5. Use `agents` or `fetch --agent <name>` to discover available context.
-6. Use `ask --to <agent> --question ... --wait` for targeted context requests.
-7. In the receiving session, run `inbox --wait`, inspect the request, and respond with `reply`.
+1. If the user is hosting, inspect saved config with `config` or `status`. If the target is unclear, ask where to host and what access is available.
+2. Run `host --agent <name>` for local/private hosting, or `host --secure --host 0.0.0.0 --public-url https://... --agent <name>` for public/AWS hosting. Give the printed `am_join_...` setup code to the other user.
+3. If the user received a setup code, run `join "am_join_..." --agent <name>`.
+4. Use `status` or `whoami` to verify the saved config works.
+5. Run `announce` with a concise summary and optional context file.
+6. Use `agents` or `fetch --agent <name>` to discover available context.
+7. Use `ask --to <agent> --question ... --wait` for targeted context requests.
+8. In the receiving session, run `inbox --wait`, inspect the request, and respond with `reply`.
 
 ## Safety Rules
 
