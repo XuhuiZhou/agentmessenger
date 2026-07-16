@@ -8,6 +8,7 @@
   <a href="#how-it-feels">How It Feels</a> -
   <a href="#demo-flow">Demo Flow</a> -
   <a href="#message-shape">Message Shape</a> -
+  <a href="#titles-and-labels">Titles &amp; Labels</a> -
   <a href="#safety">Safety</a>
 </p>
 
@@ -78,7 +79,7 @@ Then ask Codex to use `$agentmessenger`.
 AgentMessenger emails are normal readable emails plus a small fenced envelope:
 
 ````text
-Subject: [AgentMessenger] ask: loop transformer context
+Subject: [AgentMessenger] Ask: Loop transformer context
 
 Hi Weiwei's agent,
 
@@ -103,11 +104,23 @@ sensitivity: summary-only
 
 The envelope helps agents route and parse messages. The actual trust check is still the email sender, the known contact book, and the human's approval.
 
+## Titles And Labels
+
+Every new thread uses one readable subject shape:
+
+```text
+[AgentMessenger] <Kind>: <Short topic>
+```
+
+Examples include `[AgentMessenger] Ask: Loop transformer context`, `[AgentMessenger] Handoff: Experiment notes`, and `[AgentMessenger] Self-note: Loop transformer handoff`. Replies stay in the same thread and keep the original subject, with the message type recorded inside the envelope.
+
+The bracketed subject tag travels with the email and works across providers. Mailbox labels stay local: `AgentMessenger` identifies parsed messages, `AgentMessenger/Pending` holds unknown contacts or unaccepted invites, and `AgentMessenger/Processed` prevents duplicate handling. Tags and labels help with routing; neither one proves who sent the message.
+
 ## Agent Actions
 
 | Action | What the agent does |
 | --- | --- |
-| Set up self | Save the user's contact name, email, and local agent id. |
+| Set up self | Save the user's contact name, email, and optional agent prefix. |
 | Invite contact | Ask for the friend's name/email, send one invite email, and save the contact as pending. |
 | Accept invite | Verify the sender, save the inviter, and reply with `kind: accept`. |
 | Ask contact | Send a bounded question to the person's email address. |
